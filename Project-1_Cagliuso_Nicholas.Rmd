@@ -1,0 +1,572 @@
+---
+title: 'Disaster Relief Project: Part 1'
+author: "Nick Cagliuso"
+date: "2023-06-26"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r, echo = FALSE, warning = FALSE, message = FALSE, fig.width = 6, fig.height = 6, out.width = "50%", fig.align = 'center'}
+set.seed(42)
+library(knitr)
+library(tidyverse)
+library(caret)
+library(GGally)
+library(tidymodels)
+library(ggpubr)
+library(leaps)
+library(kableExtra)
+library(knitr)
+library(ROCR)
+opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE, fig.width = 6, fig.height = 6, out.width = "50%", fig.align = 'center', cache = TRUE, cache.lazy = FALSE)
+options(tinytex.verbose = TRUE)
+```
+
+# 1. Introduction
+
+The 2010 earthquake which struck Haiti left many Haitians displaced from their homes and in need of rescue efforts from foreign nations and entities thanks to widespread destruction across the country. One entity which assisted the nation in a particularly unique way was the Rochester Institute of Technology, which flew aircraft over Haiti and took photographs of the ravaged nation from above. The color of the individual pixels in each photo were then analyzed to determine where displaced people were likely to be seeking refuge --- survivors were known to use blue tarps as shelter.
+
+This project analyzes, across multiple statistical methods, pixel color information from the exact photos taken by the Rochester Institute of Technology over Haiti in 2010. Specifically, the aim is to measure the effectiveness of logistic regression, linear and quadratic discriminant analysis (LDA and QDA, respectively), K-nearest neighbors (KNN), and penalized logistic regression at successfully finding displaced Haitians. Each model will predict photo pixel "class" based on the frequency of red, green, and blue within each individual pixel; parameter tuning, cross-validation, and model performance metrics are all explored to determine which modeling method is the "best" for the rescue mission at hand.
+
+# 2. Exploratory Data Analysis
+
+```{r}
+Haiti <- read_csv('HaitiPixels.csv', show_col_types = FALSE)
+summary(Haiti)
+```
+
+Our data set contains 63,241 observations with four variables: $Class$, $Red$, $Green$, and $Blue$. $Class$ is a categorical variable which contains the possible values "Blue Tarp," "Rooftop," "Soil," "Various Non-Tarp," and "Vegetation;" these indicate what any given pixel is actually displaying as part of a larger picture of Haitian land. The remaining three variables are numerical variables which express how much red, blue, or green is present within a given pixel, on a least-to-most scale of zero to 255; these numbers represent the intensity of each color across the scale of all 256 binary numbers, hence 256 possible numerical values.[^1]
+
+[^1]: Zola, Andrew. "RGB (Red, Green and Blue)." WhatIs.Com, 3 Jan. 2023, www.techtarget.com/whatis/definition/RGB-red-green-and-blue#:\~:text=The%20RGB%20model%20uses%208,possible%20colors%20to%20be%20precise.
+
+```{r}
+pairs(Haiti[, 2:4], lower.panel = NULL)
+```
+
+We can see from the scatterplot matrix above that each of our numerical variables are strongly correlated with one another. This collinearity may be a particularly important issue as we attempt to predict the class of each pixel, as it may be difficult to properly quantify the unique impact of each of these colors on a pixel's class.[^2] Furthermore, each of these variables appears to have a heteroscedastic relationship with one another; that is, the vertical spread of the observations gradually increases as the $X$ and $Y$ values increase.
+
+[^2]: James, Gareth, et al. *An Introduction to Statistical Learning with Applications in R*. 2nd ed., Springer Nature, 2021., pp. 99-100
+
+```{r}
+Haiti <- Haiti %>% mutate(logRed = log(Red))
+Haiti <- Haiti %>% mutate(logGreen = log(Green))
+Haiti <- Haiti %>% mutate(logBlue = log(Blue))
+pairs(Haiti[, 5:7], lower.panel = NULL)
+```
+
+We can see from the next scatterplot matrix above that Log-transforming each of the numerical variables appears to have solved much of the heteroscedasticity between them, and perhaps indicates that the logs of each of these variables will end up being better predictors of whether a pixel displays a blue tarp than the original variables.
+
+```{r}
+Haiti <- Haiti %>% mutate(Tarp = ifelse(Class == "Blue Tarp", 0, 1))
+Haiti$Tarp <- as.factor(Haiti$Tarp)
+levels(Haiti$Tarp) <- c('bluetarp', 'other')
+```
+
+Since the ultimate goal of our analysis is to determine where displaced Haitians are by looking for Blue Tarps, I have added another variable to the data set named $Tarp$; it is a dummy variable which simply expresses whether a given observation's $Class$ value is "Blue Tarp."
+
+```{r}
+ggplot(Haiti, aes(x = Tarp)) +
+  geom_bar() +
+  labs(x = "Blue Tarp Dummy", y = "Count", title = "Distribution of Blue Tarp Dummy Variable")
+```
+
+Perhaps unsurprisingly, the bar chart above indicates that an extremely small share of the observations in our data set display any part of a blue tarp; in fact, numerically speaking, only approximately three percent of the observations in the data set are classified as "Blue Tarp." Although the size of the images captured is not provided by the data, it follows logically that blue tarps will take up an incredibly small portion of a landscape captured by aerial photograph.
+
+```{r}
+Blue_BP <- ggplot(Haiti, aes(x = Tarp, y = Blue)) +
+  geom_boxplot() +
+  labs(x = "Blue Tarp Dummy", y = "Blue Intensity")
+
+Red_BP <- ggplot(Haiti, aes(x = Tarp, y = Red)) +
+  geom_boxplot() +
+  labs(x = "Blue Tarp Dummy", y = "Red Intensity")
+
+Green_BP <- ggplot(Haiti, aes(x = Tarp, y = Green)) +
+  geom_boxplot() +
+  labs(x = "Blue Tarp Dummy", y = "Green Intensity")
+
+ggarrange(Blue_BP, Green_BP, Red_BP, ncol = 3, nrow = 1)
+```
+
+The leftmost box plot above indicates, unsurprisingly, that pixels displaying blue tarp generally have a significantly higher $Blue$ value than those displaying another one of the potential classes. It also makes sense that "Blue Tarp" observations generally have a higher $Green$ value than non-"Blue Tarp" observations (as indicated by the center plot above), simply given blue's similarity to green relative to other colors such as yellow or orange. This might also indicate than an interaction between $Blue$ and $Green$ may be worth including in our eventual models, as a pixel that visually appears blue may depend on also having a high value of $Green$ to look the way it does. Interestingly, the rightmost plot indicates virtually no difference between median $Red$ values in "Blue Tarp" and non-"Blue Tarp" observations. At the same time, however, it appears that most "Blue Tarp" observations are within a much narrower band of $Red$ values than non-"Blue Tarp" observations. Given the median $Red$ value of "Blue Tarp" observations is right in the middle of the range of potential values, this simply indicates that observations with extreme $Red$ values in either direction are extremely unlikely to be classified as "Blue Tarp."
+
+# 3. Model Fitting, Tuning Parameter Selection, and Evaluation
+
+Given what was discovered in our exploratory data analysis, we will use logistic regression, LDA, QDA, KNN, and penalized logistic regression on two different models, and then select one optimal one from each method: one model will regress $Tarp$ against $Red$, $Green$, $Blue$ and an interaction term between $Blue$ and $Green$, and the other will do the exact same thing with the log of each of those predictors. Firstly, given the fact that "Blue Tarp" pixels generally have higher values of both $Blue$ and $Green$, I am including an interaction term between the two variables under the presumption that higher values of green, given its similarity to the color blue compared to red, contribute to a pixel's overall "blueness." Secondly, I will be comparing that "baseline" model to the one with log-transformed predictors due to the previously-discovered heteroscedastic relationship between the numeric variables. What's more, these models will remain consistent throughout each of the modeling methods tested, as I simply believe further feature selection or subset selection is unnecessary; there is a particularly small number of possible predictors to begin with, and it is known that our response variable is classified based exclusively on color data, which is what all three original numerical variables are.
+
+Formula 1: $Tarp$ = $\beta_0$ + $\beta_1$$Red$ + $\beta_2$$Green$ + $\beta_3$$Blue$ + $\beta_4$$Blue$\*$Green$
+
+Formula 2: $Tarp$ = $\beta_0$ + $\beta_1$$logRed$ + $\beta_2$$logGreen$ + $\beta_3$$logBlue$ + $\beta_4$$logBlue$$logGreen$
+
+10-fold cross-validation will be used to evaluate the performance of each of our models within each modeling method. This involves first randomly splitting the data into a "train" and "test" set, which are 80% and 20% of the observations in our data set, respectively. Then, the "train" set will be split into 10 different "folds" of equal size, with one fold set aside as a validation fold.[^3] Model performance will be measured by comparing the predictive performance of the remaining nine folds against the validation fold. Specifically, accuracy, sensitivity, false positive rate (FPR), and precision are metrics of particular importance to us to select an optimal model. ROC curves and the AUC value will also be shown for each specific model within each modeling method. An ROC curve plots a model's true positive rate against its false positive rate at each probability threshold from zero to one; AUC (area under the curve) is a zero-to-one metric which measures a model's overall ability to simultaneously minimize false positives and maximize true positives.[^4] For future reference:[^5]
+
+[^3]: Ibid. pp. 203
+
+[^4]: Ibid. pp. 151
+
+[^5]: <https://canvas.its.virginia.edu/courses/69529/pages/project-preview-starting-the-disaster-relief-project?module_item_id=384000>
+
+"Accuracy" = the number of correctly classified observations divided by the total number of observations
+
+"Sensitivity" = the number of true positives divided by the sum of the number of true positives and false negatives
+
+"FPR" = False Positive Rate = the number of observations incorrectly classified as the reference class of our response variable divided by the total number of observations (e.g. in our case, the number of observations incorrectly labeled "Blue Tarp" divided by the total number of observations)
+
+"Precision" = the number of true positives divided by the sum of the number of true positives and false positives
+
+"Dist" = a measure of the distance of the model at a given threshold from the optimal point on the model's ROC curve
+
+It will be seen consistently for each of our models that accuracy values are exceptionally high. This is not because I have discovered the "perfect" models for classifying the response variable, but rather because of the skew in classifications within our response variable. As shown previously, the overwhelming majority of observations in our data are classified to a category other than "Blue Tarp." Therefore, in theory, simply having a model which selects "Other" rather than "Blue Tarp" for every single observation will have an exceptionally strong accuracy. As such, it is much more important to evaluate our given model in terms of how often it correctly classifies "Blue Tarp" observations specifically, not every single observation as a whole.[^6]
+
+[^6]: Brownlee, Jason. "Failure of Classification Accuracy for Imbalanced Class Distributions." *Machine Learning Mastery*, Guiding Tech Media, 21 Jan. 2021, machinelearningmastery.com/failure-of-accuracy-for-imbalanced-class-distributions/.
+
+Having established this, contextually speaking, we want our optimal model to minimize the number of times it incorrectly establishes an observation as "Other" when it is actually a "Blue Tarp" pixel. In practice, categorizing a pixel incorrectly as "Other" and sharing this information with other rescue efforts means that displaced people go unnoticed, simply because no one thinks they exist. Although resources are limited in actuality, it would be preferred to "play it safe" and overestimate the number of observations that are "Blue Tarp;" if every effort is made to visit as many "Blue Tarp" locations as possible, we at least want *all actual* blue tarps to be within our denominator of searched locations, even if a fair number of places do not actually feature a blue tarp. In other words, as a matter of risk aversion, I consider it better to search an area and find out there are no blue tarps (and therefore people) than never search an area at all and potentially forego finding displaced people. As such, it is important to select a model with a higher sensitivity; the higher a model's sensitivity, the less often it categorizes a "Blue Tarp" pixel incorrectly as "Other," causing it to go unnoticed in practice.
+
+What's more, it will be seen that the even the highest false positive rates within our models are not particularly high, meaning the number of places hypothetically searched that end up not having a blue tarp is low. As such, I will establish now that the optimal threshold selected for each model will, in most cases, be extremely close to .05, our lowest classification probability and the one that maximizes sensitivity. As was just established, given the real-life context of our analysis, it is crucial that no stone gets left un-turned in our rescue efforts (especially given the lack of knowledge about the resources available to the rescue efforts; we can somewhat reasonably suspend worry about needing to efficiently allocate a known number of rescuers, for example.)
+
+This analysis uses the "Caret" package in R for all processes directly related to model execution carried out below (i.e. setting up cross-validation, running each model, calculating performance metrics, parameter tuning).
+
+## Logistic Regression
+
+The first method that I apply to each of our models is logistic regression. No tuning parameters are required for this type of model, as logistic regression can just be said to be a modified version of linear regression designed for categorical response variables, which ensures that estimated probabilities of category classification fall between zero and one.[^7] 10-fold cross validation can be applied simply to determine the predictive performance of our two models as is. Specific to threshold selection, it is necessary to save both the classifications for each observation following validation, as well as the estimated probabilities associated with those classifications. Saving these values allows us to use multiple model efficacy metrics at different thresholds which compare each model's results to our known, actual response observations.
+
+[^7]: James, Gareth, et al. *An Introduction to Statistical Learning with Applications in R*. 2nd ed., Springer Nature, 2021., pp. 132-133
+
+    ```{r}
+    set.seed(42)
+    Validation <- trainControl(method = "repeatedcv", number = 10, classProbs = TRUE, savePredictions = TRUE)
+    #(https://topepo.github.io/caret/model-training-and-tuning.html#basic-parameter-tuning)
+    #Haiti$Tarp <- make.names(Haiti$Tarp, unique = FALSE, allow = TRUE)
+    #Haiti$Tarp <- factor(Haiti$Tarp, labels = c('other', 'bluetarp'))
+
+    Haiti_split <- initial_split(Haiti, prop = .8)
+    Train <- training(Haiti_split)
+    Test<- testing(Haiti_split)
+      
+    base_lr <- train(Tarp ~ Red + Green + Blue + Blue*Green, data = Train, method = 'glm', family = 'binomial', trControl = Validation)
+
+    log_lr <- train(Tarp ~ logRed + logGreen + logBlue + logBlue*logGreen, data = Train, method = 'glm', family = 'binomial', trControl = Validation)
+
+    base_threshold_lr <- thresholder(base_lr, threshold = seq(0.05, 0.95, by = 0.05), statistics = "all")
+
+    log_threshold_lr <- thresholder(log_lr, threshold = seq(0.05, 0.95, by = 0.05), statistics = "all")
+
+    base_threshold_lr$FNR <- 1 - base_threshold_lr$Sensitivity
+    base_threshold_lr$FPR <- 1 - base_threshold_lr$Specificity
+
+    log_threshold_lr$FNR <- 1 - log_threshold_lr$Sensitivity
+    log_threshold_lr$FPR <- 1 - log_threshold_lr$Specificity
+
+    table1 <-base_threshold_lr %>% select("prob_threshold", "Accuracy", "Sensitivity", "FPR", "Precision", "Dist") %>% kable(digits = 3) %>% kable_styling(full_width = FALSE)
+
+    table1
+    ```
+
+The table above shows us our model effectiveness metrics at each threshold for logistic regression of our "Formula 1." We see that sensitivity is unsurprisingly maximized at our lowest threshold, but there is also a very significant decrease in precision. At the next-lowest threshold (.1), we see only a marginal decrease in sensitivity but a significant improvement in precision, from .765 to .9. Given this fact and what we previously established about risk aversion when classifying blue tarps, we will compare the logistic regression of "Formula 1" at the .1 threshold to our logistic regression of "Formula 2," discussed below, to determine our optimal logistic regression model. The trade-off in sensitivity for marginally better precision as the threshold increases past .1 is not worth potentially missing more blue tarps because they were classified as "Other."
+
+```{r}
+set.seed(42)
+base_lr_prediction <- predict(base_lr, Train, type = 'prob')
+base_lr_observations <- prediction(base_lr_prediction$bluetarp, Train$Tarp, label.ordering = c('other', 'bluetarp'))
+base_lr_roc <- performance(base_lr_observations, measure = 'tpr', x.measure = 'fpr')
+plot(base_lr_roc, colorize = T, print.cutoffs.at = c(0, 0.1, 0.9, 1.0), xlim = c(0, .1), ylim = c(.8, 1), main = "ROC Curve for Base Logistic Regression")
+lines(x = c(0,1), y = c(0,1), col = 'grey')
+```
+
+```{r}
+base_lr_AUC <- performance(base_lr_observations, "auc")@y.values[[1]]
+base_lr_AUC
+```
+
+We can see from our ROC curve and the AUC value directly above that our "Formula 1" logistic regression is much more effective at correctly classifying observations than a simple "coin flip" for each observation (AUC = .5). However, it is important to keep in mind the significant skew in the share of our classifications that inherently improves the performance of our models.
+
+```{r}
+table2 <- log_threshold_lr %>% select("prob_threshold", "Accuracy", "Sensitivity", "FPR", "Precision", "Dist") %>% kable(digits = 3) %>% kable_styling(full_width = FALSE)
+
+table2
+```
+
+The table above shows us our model effectiveness metrics at each threshold for logistic regression of our "Formula 2." Similar to our previous threshold table, we see a point where our precision metric improves significantly from one threshold to the next before leveling off, which here is at .15. Just like with our logistic regression of "Formula 1," we want to maximize both our precision and sensitivity, but avoid trading off too much sensitivity for more precision. As such, we will select .15 as our optimal threshold for this logistic application of "Formula 2."
+
+```{r}
+set.seed(42)
+log_lr_prediction <- predict(log_lr, Train, type = 'prob')
+log_lr_observations <- prediction(log_lr_prediction$bluetarp, Train$Tarp, label.ordering = c('other', 'bluetarp'))
+log_lr_roc <- performance(log_lr_observations, measure = 'tpr', x.measure = 'fpr')
+plot(log_lr_roc, colorize = T, print.cutoffs.at = c(0, 0.1, 0.9, 1.0), xlim = c(0, .1), ylim = c(.8, 1), main = "ROC Curve for Logistic Regression with Log of Predictors")
+lines(x = c(0,1), y = c(0,1), col = 'grey')
+```
+
+```{r}
+log_lr_AUC <- performance(log_lr_observations, "auc")@y.values[[1]]
+log_lr_AUC
+```
+
+As was the case with our previous logistic regression, the ROC and AUC indicate extremely strong performance of our model. In both cases, our AUC has been extremely close to one (greater than .999, specifically.).
+
+Ultimately, the performance of logistic regression on each of our formulas at their selected thresholds is extremely similar. Our metrics for "Formula 1" at the .1 threshold are 0.996 accuracy, 0.977 sensitivity, 0.004 FPR, and 0.900 precision. For "Formula 2" at the .15 threshold, the same metrics are 0.996, 0.971, 0.003, and 0.916, respectively. Overall, given "Formula 2's" precision rate is .016 higher than that of "Formula 1," with a corresponding decrease in sensitivity of only .07, **we will select "Formula 2" at a .15 threshold as the optimal logistic regression model from our analysis.**
+
+## Linear Discriminant Analysis
+
+The application of our formulas to Linear Discriminant Analysis is very similar to that of logistic regression; no tuning parameters are required, and we can use the exact same form of 10-fold cross-validation to measure model efficacy at each threshold. Specifically, tuning parameters are not needed because LDA classifies each observation based on the posterior probability that an observation is in a given class, and is therefore similar in nature to other parametric approaches such as logistic regression.[^8]
+
+[^8]: Ibid. pp. 141-142, 163
+
+    ```{r}
+    set.seed(42)
+    base_lda <- train(Tarp ~ Red + Green + Blue + Blue*Green, data = Train, method = 'lda', trControl = Validation)
+
+    log_lda <- train(Tarp ~ logRed + logGreen + logBlue + logBlue*logGreen, data = Train, method = 'lda', trControl = Validation)
+
+    base_lda_threshold <- thresholder(base_lda, threshold = seq(0.05, 0.95, by = 0.05), statistics = "all")
+
+    log_lda_threshold <- thresholder(log_lda, threshold = seq(0.05, 0.95, by = 0.05), statistics = "all")
+
+    base_lda_threshold$FNR <- 1 - base_lda_threshold$Sensitivity
+    base_lda_threshold$FPR <- 1 - base_lda_threshold$Specificity
+
+    log_lda_threshold$FNR <- 1 - log_lda_threshold$Sensitivity
+    log_lda_threshold$FPR <- 1 - log_lda_threshold$Specificity
+
+    table3 <- base_lda_threshold %>% select("prob_threshold", "Accuracy", "Sensitivity", "FPR", "Precision", "Dist") %>% kable(digits = 3) %>% kable_styling(full_width = FALSE)
+
+    table3
+    ```
+
+The table above shows us our model effectiveness metrics at each threshold for LDA applied to our "Formula 1." We can see, just like with our logistic regressions, precision increases significantly from one threshold to the next before relatively leveling off. Here. precision increases by .16 from the .05 to .1 thresholds, with a corresponding decrease in sensitivity of less than .01. After that threshold, however, sensitivity continues to decrease at a consistent rate without any more significant jumps in precision. As such, our optimal threshold for LDA applied to "Formula 1" will be .1.
+
+```{r}
+set.seed(42)
+base_lda_prediction <- predict(base_lda, Train, type = 'prob')
+base_lda_observations <- prediction(base_lda_prediction$bluetarp, Train$Tarp, label.ordering = c('other', 'bluetarp'))
+base_lda_roc <- performance(base_lda_observations, measure = 'tpr', x.measure = 'fpr')
+plot(base_lda_roc, colorize = T, print.cutoffs.at = c(0, 0.1, 0.9, 1.0), xlim = c(0, .1), ylim = c(.8, 1), main = "ROC Curve for Base LDA")
+lines(x = c(0,1), y = c(0,1), col = 'grey')
+```
+
+```{r}
+base_lda_AUC <- performance(base_lda_observations, "auc")@y.values[[1]]
+base_lda_AUC
+```
+
+Despite a strong ROC for LDA applied to "Formula 1" as shown above, our AUC can be said to be a "thousandth" worse than those from our logistic regressions, which had values greater than .999, even approaching or clearing .9995.
+
+```{r}
+table4 <- log_lda_threshold %>% select("prob_threshold", "Accuracy", "Sensitivity", "FPR", "Precision", "Dist") %>% kable(digits = 3) %>% kable_styling(full_width = FALSE)
+
+table4
+```
+
+Interestingly, the sensitivities for our LDA applied to "Formula 2," as shown above, are notably higher than those from LDA applied to "Formula 1." At the same precision of .932, "Formula 1's" sensitivity was .889, and directly above we can see "Formula 2's" is .944. This immediately indicates that LDA applied to "Formula 2" is a much stronger application of this statistical method than when used on "Formula 1." When it comes to threshold selection, we can again see the pattern of a significant jump in precision before it plateaus, which here seems to occur at the .15 threshold; as such, we will select .15 as our optimal threshold for LDA applied to "Formula 2" (an argument can be made to select .1 as the threshold, given the sensitivity is .08 higher, but it also comes at the cost of a .015-lower precision which could, in practice, reduce the efficiency of rescue efforts because of a larger share of false "Blue Tarps.").
+
+```{r}
+set.seed(42)
+log_lda_prediction <- predict(log_lda, Train, type = 'prob')
+log_lda_observations <- prediction(log_lda_prediction$bluetarp, Train$Tarp, label.ordering = c('other', 'bluetarp'))
+log_lda_roc <- performance(log_lda_observations, measure = 'tpr', x.measure = 'fpr')
+plot(log_lda_roc, colorize = T, print.cutoffs.at = c(0, 0.1, 0.9, 1.0), xlim = c(0, .1), ylim = c(.8, 1), main = "ROC Curve for LDA with Log of Predictors")
+lines(x = c(0,1), y = c(0,1), col = 'grey')
+```
+
+```{r}
+log_lda_AUC <- performance(log_lda_observations, "auc")@y.values[[1]]
+log_lda_AUC
+```
+
+Given the notably better performance of LDA on "Formula 2" relative to "Formula 1," it is unsurprising that the ROC curve and AUC directly above fall much more in line with those from our logistic regression, which also saw better overall metrics than our LDA applied to "Formula 1." Given this fact, **we will select "Formula 2" at a .15 threshold as the optimal LDA application from our analysis.**
+
+## Quadratic Discriminant Analysis
+
+Quadratic Discriminant Analysis is a similar parametric approach to LDA (and therefore logistic regression, to a degree), with the only difference being that the formula which helps to classify observations is quadratic rather than linear.[^9] As such, once again, tuning parameters are not required and we can use the exact same form of 10-fold cross-validation to measure model efficacy at each threshold.
+
+[^9]: Ibid. pp. 143, 146, 153
+
+    ```{r}
+    set.seed(42)
+    base_qda <- train(Tarp ~ Red + Green + Blue + Blue*Green, data = Train, method = 'qda', trControl = Validation)
+
+    log_qda <- train(Tarp ~ logRed + logGreen + logBlue + logBlue*logGreen, data = Train, method = 'qda', trControl = Validation)
+
+    base_qda_threshold <- thresholder(base_qda, threshold = seq(0.05, 0.95, by = 0.05), statistics = "all")
+
+    log_qda_threshold <- thresholder(log_qda, threshold = seq(0.05, 0.95, by = 0.05), statistics = "all")
+
+    base_qda_threshold$FNR <- 1 - base_qda_threshold$Sensitivity
+    base_qda_threshold$FPR <- 1 - base_qda_threshold$Specificity
+
+    log_qda_threshold$FNR <- 1 - log_qda_threshold$Sensitivity
+    log_qda_threshold$FPR <- 1 - log_qda_threshold$Specificity
+
+    table5 <- base_qda_threshold %>% select("prob_threshold", "Accuracy", "Sensitivity", "FPR", "Precision", "Dist") %>% kable(digits = 3) %>% kable_styling(full_width = FALSE)
+
+    table5
+    ```
+
+We can immediately see from the table above that our "Formula 1" applied to QDA results in very poor precision relative to our previous models; it is not until a threshold of .85 that precision exceeds .900. Interestingly, despite the very wide range in precision across thresholds, this does not correspond to an equally wide range in sensitivity. While precision ranges from .539 to .980 across thresholds, the corresponding sensitivities only range from .956 to .861. As such, we can afford to select a high threshold for this model without worrying about our sensitivity completely cratering. Unlike for previous models, the trade-off of precision for maximum sensitivity is too severe; in practice, choosing a low threshold would result in a multitude of rescue searches coming up empty. As such, it appears that the optimal threshold for this model is our maximum threshold of .95; we see a significant jump in precision from thresholds even .1 lower, and our sensitivity (while less-than-ideal) still shows that false negatives occur only fourteen percent of the time. In fact, the maximum threshold's precision of .98 is so high that it can be argued it completely flips our original scale; at this threshold, we know that even if we forego searching areas where they may be survivors, we are simultaneously much, much more likely to find people in the places we do look. It flips the perspective of "risk aversion" previously established completely on its head.
+
+```{r}
+set.seed(42)
+base_qda_prediction <- predict(base_qda, Train, type = 'prob')
+base_qda_observations <- prediction(base_qda_prediction$bluetarp, Train$Tarp, label.ordering = c('other', 'bluetarp'))
+base_qda_roc <- performance(base_qda_observations, measure = 'tpr', x.measure = 'fpr')
+plot(base_qda_roc, colorize = T, print.cutoffs.at = c(0, 0.1, 0.9, 1.0), xlim = c(0, .1), ylim = c(.8, 1), main = "ROC Curve for Base QDA")
+lines(x = c(0,1), y = c(0,1), col = 'grey')
+```
+
+```{r}
+base_qda_AUC <- performance(base_qda_observations, "auc")@y.values[[1]]
+base_qda_AUC
+```
+
+Given this application of QDA did not perform as well as other tested models in terms of sensitivity, it is unsurprising to see the ROC Curve and AUC above fall more in line with those of the application of LDA to "Formula 1," which struggled very similarly.
+
+```{r}
+table6 <- log_qda_threshold %>% select("prob_threshold", "Accuracy", "Sensitivity", "FPR", "Precision", "Dist") %>% kable(digits = 3) %>% kable_styling(full_width = FALSE)
+
+table6
+```
+
+The table above indicates that QDA applied to "Formula 2" sees much better sensitivities and precisions compared to its previous application to "Formula 1." While the range of precisions above is still relatively high, it is less than in the previous table, and the corresponding sensitivities are much higher at any given precision point. As such, to select the optimal threshold for this model, we can go back to the original approach of looking at where precision seems to level off and the subsequent trade-offs of sensitivity are not worth the marginal increase in precision. It appears that that threshold for this application of QDA to "Formula 2" is at .25, where precision increases by almost .08 from the previous threshold but sensitivity only decreases by .009. What's more, that sensitivity in it of itself is still at nearly .970.
+
+```{r}
+set.seed(42)
+log_qda_prediction <- predict(log_qda, Train, type = 'prob')
+log_qda_observations <- prediction(log_qda_prediction$bluetarp, Train$Tarp, label.ordering = c('other', 'bluetarp'))
+log_qda_roc <- performance(log_qda_observations, measure = 'tpr', x.measure = 'fpr')
+plot(log_qda_roc, colorize = T, print.cutoffs.at = c(0, 0.1, 0.9, 1.0), xlim = c(0, .1), ylim = c(.8, 1), main = "ROC Curve for QDA of Log of Predictors")
+lines(x = c(0,1), y = c(0,1), col = 'grey')
+```
+
+```{r}
+log_qda_AUC <- performance(log_qda_observations, "auc")@y.values[[1]]
+log_qda_AUC
+```
+
+The ROC Curve and AUC above reinforce the fact that QDA applied to "Formula 2" is a much stronger model than QDA applied to "Formula 1." The difference in AUC from the former to the latter is over two-thousandths (relatively significant at these values of AUC because of classification skew), and the ROC Curve directly above is much closer to the optimal top-left of the plot than our previous curve. As such, **we will select "Formula 2" at a .25 threshold as the optimal QDA application from our analysis.**
+
+## K-Nearest Neighbors
+
+K-Nearest Neighbors is the first instance of needing to do parameter tuning in this analysis. Specifically, we need to optimize the value of "K" within our regression. This value refers to the number of closest observations which are compared to the observation we are attempting to classify at any given moment. As such, the application of KNN requires two iterations of 10-fold cross-validation for each formula. First, cross-validation is used to select the optimal value of "K" from one to fifteen in increments of two (in other words, every odd number from 1 to 15) on each of our formulas. With this approach, cross-validation selects the value of K at which the ROC curve is best (closest to the top-left of the plot). I would have selected a wider range of K-values, but the decision to limit it from one to fifteen simply came down to the performance abilities of my computer; run-times for cross-validation at greater ranges of K were unreasonably long.
+
+After the optimal K is selected by cross-validation, we re-run cross-validation on each of our formulas, but input the optimal value of K rather than asking the function to iterate through our sequence of potential K's. It is this second use of cross-validation which allows us to choose the optimal threshold for KNN application to our formulas.
+
+It should also be noted that for KNN, our data is scaled to avoid issues with the size of values in our predictor variables, as values are across multiple orders of magnitude. This is particularly impactful for distance-based statistical methods, as higher-magnitude observations can skew the results of analysis; as such, it is necessary to normalize our predictor variables by subtracting the mean of each predictor from each of its observations, and then dividing each predictor's observation by that variable's standard deviation.[^10][^11]
+
+[^10]: Sharma, Pulkit. "Why Is Scaling Required in KNN and K-Means?" *Medium*, 25 Aug. 2019, medium.com/analytics-vidhya/why-is-scaling-required-in-knn-and-k-means-8129e4d88ed7.
+
+[^11]: caret's "preProcess" R Documentation
+
+    ```{r}
+    set.seed(42)
+    knn_validation <- trainControl(method = "repeatedcv", number = 10, classProbs = TRUE, savePredictions = TRUE, summaryFunction = twoClassSummary)
+
+    tunegrid <- data.frame(k = seq(1, 15, by = 2))
+
+    Scaling <- preProcess(Train, method = c("center", "scale"))
+    Scaled_Train <- predict(Scaling, Train)
+    #(https://topepo.github.io/caret/pre-processing.html#centering-and-scaling)  
+                           
+    base_knn <- train(Tarp ~ Red + Green + Blue + Blue*Green, data = Scaled_Train, method = 'knn', trControl = knn_validation, tuneGrid = tunegrid, metric = "ROC")
+
+    base_knn
+    ```
+
+We can see from the output above that within our range of potential K-values, the value with the highest "ROC" is 13; as such, that will be the K-value we will use for our KNN applied to "Formula 1."
+
+```{r}
+set.seed(42)
+base_knn_13 <- train(Tarp ~ Red + Green + Blue + Blue*Green, data = Scaled_Train, method = 'kknn', trControl = knn_validation, k = 13, metric = "ROC")
+
+base_knn_threshold <- thresholder(base_knn_13, threshold = seq(0.05, 0.95, by = 0.05), statistics = "all")
+
+base_knn_threshold$FNR <- 1 - base_knn_threshold$Sensitivity
+base_knn_threshold$FPR <- 1 - base_knn_threshold$Specificity
+
+table7 <- base_knn_threshold %>% select("prob_threshold", "Accuracy", "Sensitivity", "FPR", "Precision", "Dist") %>% kable(digits = 3) %>% kable_styling(full_width = FALSE)
+
+table7
+```
+
+The table above shows extremely strong performance of our KNN applied to "Formula 1" relative to previously-used models. Precision ranges from a low of only .872 to nearly the maximum value of 1, and sensitivity remains above .900 for all thresholds at .75 and below. In fact, even at a sensitivity of over .950, precision only falls to .954 from .996, its value at the highest threshold. Given this fact, we can afford to prioritize sensitivity, as is our preference, without significantly hindering precision. By that logic, I will select .20 as the optimal threshold for this model; sensitivity at that threshold is an exceptional .982, and we keep precision above the (admittedly arbitrary) .900 value.
+
+```{r}
+set.seed(42)
+knn_prediction <- prediction(predict(base_knn, Scaled_Train, type = "prob")$bluetarp, Scaled_Train$Tarp, label.ordering = c('other', 'bluetarp'))
+
+knn_observations <- performance(knn_prediction, measure = 'tpr', x.measure = 'fpr')
+
+plot(knn_observations, colorize = T, print.cutoffs.at = c(0, 0.1, 0.9, 1.0), xlim = c(0, .1), ylim = c(.7, 1), main = "ROC Curve for Base KNN with K = 13")
+lines(x = c(0,1), y = c(0,1), col = 'grey')
+```
+
+```{r}
+set.seed(42)
+log_knn <- train(Tarp ~ logRed + logGreen + logBlue + logBlue*logGreen, data = Scaled_Train, method = 'knn', trControl = knn_validation, tuneGrid = tunegrid, metric = "ROC")
+
+log_knn
+```
+
+We can see from the output above that within our range of potential K-values, the value with the highest "ROC" is 15; as such, that will be the K-value we will use for our KNN applied to "Formula 2."
+
+```{r}
+set.seed(42)
+log_knn_15 <- train(Tarp ~ logRed + logGreen + logBlue + logBlue*logGreen, data = Scaled_Train, method = 'kknn', trControl = knn_validation, k = 15, metric = "ROC")
+
+log_knn_threshold <- thresholder(log_knn_15, threshold = seq(0.05, 0.95, by = 0.05), statistics = "all")
+
+log_knn_threshold$FNR <- 1 - log_knn_threshold$Sensitivity
+log_knn_threshold$FPR <- 1 - log_knn_threshold$Specificity
+
+table8 <- log_knn_threshold %>% select("prob_threshold", "Accuracy", "Sensitivity", "FPR", "Precision", "Dist") %>% kable(digits = 3) %>% kable_styling(full_width = FALSE)
+
+table8
+```
+
+Once again, we see particularly strong performance for KNN, this time applied to "Formula 2." Precision ranges from only .873 to .996, and sensitivity is greater than .900 at all thresholds up-to-and-including .75. Given these facts and this table's similarity to our previous KNN table, we will select .25 as a similarly low optimal threshold, this time of course applied to "Formula 2." At this threshold, precision has increased by nearly .020 from a threshold of .15, while sensitivity has simultaneously decreased by only .006. Furthermore, that decrease still results in an extremely impressive sensitivity of .982. It could be argued that you can select the threshold of .20 for this KNN implementation, but that would result in a sensitivity increase of only .002 with a .009 loss in precision.
+
+```{r}
+set.seed(42)
+knn_log_prediction <- prediction(predict(log_knn, Scaled_Train, type = "prob")$bluetarp, Scaled_Train$Tarp, label.ordering = c('other', 'bluetarp'))
+
+knn_log_observations <- performance(knn_log_prediction, measure = 'tpr', x.measure = 'fpr')
+
+plot(knn_log_observations, colorize = T, print.cutoffs.at = c(0, 0.1, 0.9, 1.0), xlim = c(0, .1), ylim = c(.8, 1), main = "ROC Curve for KNN with Log of Predictors with K = 15")
+lines(x = c(0,1), y = c(0,1), col = 'grey')
+```
+
+Ultimately, KNN performed extremely well on each of our formulas, and performance at the selected thresholds for each formula are extremely similar. Our metrics for "Formula 1" at the .20 threshold are 0.996 accuracy, 0.985 sensitivity, 0.004 FPR, and 0.902 precision. For "Formula 2" at the .25 threshold, the same metrics are 0.997, 0.983, 0.003, and 0.916, respectively. Overall, given "Formula 2's" precision rate is .014 higher than that of "Formula 1," with a corresponding decrease in sensitivity of only .02, **we will select "Formula 2" at a .25 threshold as the optimal KNN application from our analysis.**
+
+## Penalized Logistic Regression
+
+The final method we will use to predict observations of our data's categorical variable is penalized logistic regression, specifically using "elastic net penalty." This approach involves modifying our logistic regression by using a combination of both ridge and lasso regression[^12], which are methods of reducing a model's coefficients towards zero in an attempt to improve overall model performance.[^13] In order to implement elastic net penalty, we must first properly adjust two tuning parameters. $\lambda$, our first tuning parameter, is a parameter which determines the extent to which a model's coefficients are shrunk towards zero.[^14] $\alpha$, meanwhile is the tuning parameter on a zero-to-one scale which determines the share of ridge or lasso regression applied to our penalized logistic regression.[^15]
+
+[^12]: Godwin, James; Andrew. "Ridge, LASSO and ElasticNet Regression." *Medium*, 16 Apr. 2021, towardsdatascience.com/ridge-lasso-and-elasticnet-regression-b1f9c00ea3a3.
+
+[^13]: James, Gareth, et al. *An Introduction to Statistical Learning with Applications in R*. 2nd ed., Springer Nature, 2021., pp. 237
+
+[^14]: Ibid.
+
+[^15]: Deol, Gurkamal. "An Introduction to Ridge, Lasso, and Elastic Net Regression." *HackerNoon*, 20 Feb. 2019, hackernoon.com/an-introduction-to-ridge-lasso-and-elastic-net-regression-cca60b4b934f.
+
+We begin by establishing a table of all possible $\lambda$ values, which will be inputted into our 10-fold cross validation; this range will encompass one hundred values from $10^{-2}$ to $10^{10}$, which James et. al. say cover "the full range of scenarios from the null model containing only the intercept, to the least squares fit."[^16] In addition, we set our $alpha$ range to the known zero-to-one scale, arbitrarily sequenced by .05. Like when adjusting the tuning parameter for KNN, cross-validation will iterate over all possible values of alpha and lambda for each of our formulas. We can then determine the optimal value of each by looking at various model performance metrics. Lastly, it is necessary to used our scaled data when implementing penalized logistic regression, as variations in observation values can significantly change the estimated coefficients produced by shrinkage methods.[^17]
+
+[^16]: James, Gareth, et al. *An Introduction to Statistical Learning with Applications in R*. 2nd ed., Springer Nature, 2021., pp. 275
+
+[^17]: Ibid., pp. 239
+
+```{r}
+set.seed(42)
+lambda_seq <- 10^seq(10, -2, length = 100)
+alpha_seq <- seq(0, 1, length = 10)
+#(https://www.projectpro.io/recipes/implement-elastic-net-regression-r)
+
+tuneGrid <- expand.grid(lambda = lambda_seq, alpha = alpha_seq)
+
+base_elastic <- train(Tarp ~ Red + Green + Blue + Blue*Green, data = Scaled_Train, method = 'glmnet', family = 'binomial', trControl = knn_validation, tuneGrid = tuneGrid, metric = "ROC")
+
+base_el_threshold <- thresholder(base_elastic, threshold = seq(.05, .95, by = 0.05), final = TRUE, statistics = "all")
+```
+
+For the sake of brevity, the exact output of our cross-validation on the logistic regression of "Formula 1" with a range of $\lambda$ and $\alpha$ is not shown due to the immense number of possible $\lambda$ and $\alpha$ combinations. However, it did state "ROC was used to select the optimal model using the largest value. The final values used for the model were alpha = 1 and lambda = 0.01." At this point, the AUC was calculated as .9758753. This is a particularly interesting result, as those are our highest and lowest possible values for each of our parameters, respectively. Given the known effectiveness of our logistic regression, this could simply indicate that a penalized version of the model could not produce more effective predictions of our response variable's observations; as James et. al. say, "When λ = 0, the penalty term has no effect, and ridge regression will produce the least squares estimates." [^18]
+
+[^18]: Ibid., pp. 237
+
+    ```{r}
+    base_el_threshold
+    ```
+
+The table above reinforces this fact, as even at the optimal $\lambda$ and $\alpha$ values for our penalized logistic regression, sensitivity is poor relative to previously-tested models.
+
+```{r}
+base_el_threshold_2 <- thresholder(base_elastic, threshold = seq(0.05, 0.95, by = 0.05), statistics = "all")
+
+base_el_threshold_2$FNR <- 1 - base_el_threshold$Sensitivity
+base_el_threshold_2$FPR <- 1 - base_el_threshold$Specificity
+
+table9 <- base_el_threshold_2 %>% select("prob_threshold", "Accuracy", "Sensitivity", "FPR", "Precision", "Dist") %>% kable(digits = 3) %>% kable_styling(full_width = FALSE)
+
+table9
+```
+
+This table above shows, unsurprisingly, that our penalized logistic regression on "Formula 1" has particularly poor performance on our metrics of choice. While it has usually been the priority to maximize sensitivity during threshold selection, that cannot be the case here due to incredibly low precision values when sensitivity is maximized. As such, .20 will be the selected threshold for this model; while sensitivity is much lower than ideally desired (.680), we at least maximize our precision such that nearly all observations classified as blue tarps are indeed blue tarps, even if many others are missed.
+
+```{r}
+set.seed(42)
+base_el_prediction <- prediction(predict(base_elastic, Scaled_Train, type = "prob")$bluetarp, Scaled_Train$Tarp, label.ordering = c('other', 'bluetarp'))
+
+base_el_observations <- performance(base_el_prediction, measure = 'tpr', x.measure = 'fpr')
+
+plot(base_el_observations, colorize = T, print.cutoffs.at = c(0, 0.1, 0.9, 1.0), xlim = c(0, .1), ylim = c(.1, 1), main = "ROC Curve for Base PLS with lambda = .01, alpha = 1")
+lines(x = c(0,1), y = c(0,1), col = 'grey')
+```
+
+Unsurprisingly, the ROC curve for this implementation of penalized logistic regression appears to be the worst of any we have encountered yet.
+
+```{r}
+set.seed(42)
+log_elastic <- train(Tarp ~ logRed + logGreen + logBlue + logBlue*logGreen, data = Scaled_Train, method = 'glmnet', family = 'binomial', trControl = knn_validation, tuneGrid = tuneGrid, metric = "ROC")
+
+log_el_threshold <- thresholder(log_elastic, threshold = seq(.05, .95, by = 0.05), final = TRUE, statistics = "all")
+```
+
+Once again, the exact output of our cross-validation, this time on the logistic regression of "Formula 2," is not shown. This time, it states "ROC was used to select the optimal model using the largest value. The final values used for the model were alpha = 0 and lambda = 0.01." At this point, the AUC was calculated as .9737991. Just like in our previous penalized logistic regression, the minimum value of $\lambda$ was chosen. This time, however, the minimum value of $\alpha$ was selected rather than the maximum of 1. Perhaps this is arbitrary, as the minimum value of $\lambda$ indicates again that the effect of shrinkage will be minimized on our model, so the type of shrinkage method is irrelevant.
+
+```{r}
+log_el_threshold
+```
+
+It appears from the table above that sensitivity at the lowest threshold of .05 is better for PLR applied to "Formula 2" compared to "Formula 1," but it quickly diminishes all the way to zero soon afterwards.
+
+```{r}
+log_el_threshold_2 <- thresholder(log_elastic, threshold = seq(0.05, 0.95, by = 0.05), statistics = "all")
+
+log_el_threshold_2$FNR <- 1 - log_el_threshold$Sensitivity
+log_el_threshold_2$FPR <- 1 - log_el_threshold$Specificity
+
+table10 <- log_el_threshold_2 %>% select("prob_threshold", "Accuracy", "Sensitivity", "FPR", "Precision", "Dist") %>% kable(digits = 3) %>% kable_styling(full_width = FALSE)
+
+table10
+```
+
+Our options for optimal threshold selection for PLR applied to "Formula 2" are few and far between. Given the extremely low precision of .152 when sensitivity is maximized in the table above, we cannon afford to blindly prioritize a high sensitivity. Rather, .10 appears to be the best threshold to select for this model. It has the same precision (1, in fact) as that of the .15 threshold, but a sensitivity over .430 higher.
+
+```{r}
+set.seed(42)
+log_el_prediction <- prediction(predict(log_elastic, Scaled_Train, type = "prob")$bluetarp, Scaled_Train$Tarp, label.ordering = c('other', 'bluetarp'))
+
+log_el_observations <- performance(log_el_prediction, measure = 'tpr', x.measure = 'fpr')
+
+plot(log_el_observations, colorize = T, print.cutoffs.at = c(0, 0.1, 0.9, 1.0), xlim = c(0, 1), ylim = c(.1, 1), main = "ROC Curve for PLR of 'Formula 2' with lambda = .01, alpha = 0")
+lines(x = c(0,1), y = c(0,1), col = 'grey')
+```
+
+Unsurprisingly, the ROC curve for this implementation of PLR appears to be much worse than that of nearly every other model previously evaluated, other than falling in line with the ROC curve for the previous PLR. Given that our chosen threshold for the PLR model on "Formula 1" had a sensitivity of .681 and precision of .999, compared to values of .527 and 1.0 for the PLR model on "Formula 2," **we will select "Formula 1" at a .20 threshold as the optimal Penalized Logistic Regression from our analysis.**
+
+# Performance Table
+
+| **Model**                                    | **Optimal Tuning Parameters** | **AUC**    | **Selected Threshold** | **Accuracy** | **TPR** | **FPR** | **Precision** |
+|-----------|---------|---------|---------|---------|---------|---------|---------|
+| Logistic Regression on "Formula 2"           | N/A                           | *.9993638* | .15                    | .996         | .971    | .003    | .916          |
+| LDA on "Formula 2"                           | N/A                           | .9991644   | .15                    | .996         | .959    | .003    | .911          |
+| QDA on "Formula 2"                           | N/A                           | .9991507   | .25                    | .995         | .966    | .004    | .901          |
+| KNN on "Formula 2"                           | K = 15                        | .9991352   | .25                    | .996         | *.982*  | .003    | .913          |
+| Penalized Logistic Regression on "Formula 1" | alpha = 1, lambda = .01       | .9758753   | .20                    | .990         | .680    | *.000*  | *0.999*       |
+
+Each of the metrics above were calculated across the implementation of 10-fold cross-validation. Specifically, each metric shown above is its average at that given threshold across all ten iterations of cross-validation.[^19]
+
+[^19]: Curtis, John J. "4.4 K-Fold Cross-Validation." Introduction to Applied Machine Learning, University of Wisconsin-Madison Department of Psychology, Madison, Wisconsin, 2020. 
+
+# Conclusions
+
+## 1.
+
+As has been established previously, given the context of rescue efforts in Haiti and avoiding misclassifying blue tarps as another category, the most important metrics for optimal model selection throughout this research have been sensitivity and precision. As such, I have determined that the overall optimal model which works best for this data analysis is **KNN applied to "Formula 2" at the .25 probability threshold.** As shown in the performance table above, this model has the highest sensitivity of all five optimal models by over a hundredth, while maintaining the second-highest precision among logistic regression, LDA, QDA, and itself. Overall, our KNN model is the best of both worlds: of the four realistic models to choose from above, KNN best maximizes the number of blue tarps in our denominator from which rescue workers will search, while also minimizing the number of times a search will come up empty.
+
+## 2.
+
+Despite my selection of KNN as the optimal model of the five above, there appeared to be multiple adequately performing methods which had similar performance metrics to those of KNN. In fact, all of the models in the performance table above except for penalized logistic regression had very similar performance metric values. Each of logistic regression, LDA, QDA, and KNN at their optimal thresholds had sensitivities of .959 or greater and precision values of .901 or higher. Despite the fact that many of these performance metrics are nearly suspiciously strong, I have a high level of confidence in the results for these for metrics. This is because we know that 97 percent of the observations in our original data set are classified in a category other than "Blue Tarp," and the only given numerical variables are extremely similar to one another and directly contribute to that classification. As such, we would expect our models to perform well when most observations can be easily classified and there are no issues of omitted variable bias or subset selection. It is thanks to this, and the real-life context of this data, that I can be particular enough to scrutinize metrics down to the one-thousandth (as I have done throughout this research); assuming the results of these models are trusted, every change in a metric's value by any amount can be the difference between a rescuer finding a displaced person and completely forgoing searching the area where that person might be.
+
+## 3.
+
+One consideration for future research on this topic and with this data would be determining a more reliable method for selecting the optimal threshold for each optimal model within the context I originally established. In other words, I would like to determine a more concrete way of answering the question, "which threshold allows us to ensure we correctly identify all blue tarps, while also minimizing the number of 'false alarms' we produce?" As I detailed previously, my shorthand method of answering this question was simply by observing where the marginal trade-off between sensitivity and precision *appeared* to reach a point where an increase in one was not worth the decrease in the other. Perhaps a more concrete solution involves some sort of calculation of the "diminishing marginal returns" of one of these metrics within the context of the other (i.e. actually tangibly calculating where the increase in one of the metrics corresponds with an "inefficient" decrease/tradeoff in the other).
