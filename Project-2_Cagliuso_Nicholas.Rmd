@@ -1,0 +1,1193 @@
+---
+title: 'Disaster Relief Project: Part 2'
+author: "Nick Cagliuso"
+date: "2023-08-01"
+output: pdf_document
+---
+
+```{r, echo = FALSE, warning = FALSE, message = FALSE, fig.width = 6, fig.height = 6, out.width = "50%", fig.align = 'center'}
+set.seed(42)
+library(knitr)
+library(tidyverse)
+library(caret)
+library(GGally)
+library(tidymodels)
+library(ggpubr)
+library(leaps)
+library(kableExtra)
+library(knitr)
+library(ROCR)
+library(e1071)
+library(kernlab)
+library(pROC)
+opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE, fig.width = 6, fig.height = 6, out.width = "50%", fig.align = 'center', cache = TRUE, cache.lazy = FALSE)
+options(tinytex.verbose = TRUE)
+```
+
+# 1. Introduction
+
+The 2010 earthquake which struck Haiti left many Haitians displaced from their homes and in need of rescue efforts from foreign nations and entities thanks to widespread destruction across the country. One entity which assisted the nation in a particularly unique way was the Rochester Institute of Technology, which flew aircraft over Haiti and took photographs of the ravaged nation from above. The color of the individual pixels in each photo were then analyzed to determine where displaced people were likely to be seeking refuge --- survivors were known to use blue tarps as shelter.
+
+In Part 1 of this project, multiple statistical methods were used to analyze pixel color information from the exact photos taken by the Rochester Institute of Technology over Haiti in 2010. Specifically, logistic regression, linear and quadratic discriminant analysis (LDA and QDA, respectively), K-nearest neighbors (KNN), and penalized logistic regression were measured in terms of their ability to successfully find displaced Haitians. Specifically, each model predicted photo pixel "class" based on the frequency of red, green, and blue within each individual pixel; parameter tuning, cross-validation, and model performance metrics were all explored to determine which modeling method was the "best" for the rescue mission at hand.
+
+In Part 2 of this project, those same statistical methods will be reevaluated in the context of a "holdout" set of data containing over two million pixel records from multiple aerial photographs of Haiti in 2010; that is, each method will be trained with cross-validation using the original data set, and the optimal selected model from each method will be tested on this new holdout set. Furthermore, two more statistical methods --- random forests and support vector machines --- are included in the set of evaluated model types. Ultimately, the goal of this project is to reach a final conclusion on the optimal model for tackling our real-world problem.
+
+# 2. Exploratory Data Analysis
+
+## Training Data
+
+```{r}
+Haiti <- read_csv('HaitiPixels.csv', show_col_types = FALSE)
+summary(Haiti)
+```
+
+Our training data set contains 63,241 observations with four variables: $Class$, $Red$, $Green$, and $Blue$. $Class$ is a categorical variable which contains the possible values "Blue Tarp," "Rooftop," "Soil," "Various Non-Tarp," and "Vegetation;" these indicate what any given pixel is actually displaying as part of a larger picture of Haitian land. The remaining three variables are numerical variables which express how much red, blue, or green is present within a given pixel, on a least-to-most scale of zero to 255; these numbers represent the intensity of each color across the scale of all 256 binary numbers, hence 256 possible numerical values.[^1]
+
+[^1]: Zola, Andrew. "RGB (Red, Green and Blue)." WhatIs.Com, 3 Jan. 2023, www.techtarget.com/whatis/definition/RGB-red-green-and-blue#:\~:text=The%20RGB%20model%20uses%208,possible%20colors%20to%20be%20precise.
+
+```{r}
+pairs(Haiti[, 2:4], lower.panel = NULL)
+```
+
+We can see from the scatterplot matrix above that each of our numerical variables are strongly correlated with one another. As was recognized in Part 1 of this project, this collinearity could potentially impact class prediction for each pixel, as it may be difficult to properly quantify the unique impact of each color on a pixel's class.[^2] Furthermore, it was also previously established that each of these variables appear to have a heteroscedastic relationship with one another; that is, the vertical spread of the observations gradually increases as the $X$ and $Y$ values increase.
+
+[^2]: James, Gareth, et al. *An Introduction to Statistical Learning with Applications in R*. 2nd ed., Springer Nature, 2021., pp. 99-100
+
+```{r}
+Haiti <- Haiti %>% mutate(logRed = log(Red))
+Haiti <- Haiti %>% mutate(logGreen = log(Green))
+Haiti <- Haiti %>% mutate(logBlue = log(Blue))
+pairs(Haiti[, 5:7], lower.panel = NULL)
+```
+
+We can see from the next scatterplot matrix above that Log-transforming each of the numerical variables, as was also done in Part 1, appears to have solved much of the heteroscedasticity between them. From what was seen in the results from Part 1, the logs of each of these variables were generally better predictors of whether a pixel displayed a blue tarp than the original variables.
+
+```{r}
+Haiti <- Haiti %>% mutate(Tarp = ifelse(Class == "Blue Tarp", 0, 1))
+Haiti$Tarp <- as.factor(Haiti$Tarp)
+levels(Haiti$Tarp) <- c('bluetarp', 'other')
+```
+
+Since the ultimate goal of our analysis is to determine where displaced Haitians are by looking for Blue Tarps, another variable is added to the training data set named $Tarp$; it is a dummy variable which simply expresses whether a given observation's $Class$ value is "Blue Tarp."
+
+```{r}
+ggplot(Haiti, aes(x = Tarp)) +
+  geom_bar() +
+  labs(x = "Blue Tarp Dummy", y = "Count", title = "Distribution of Blue Tarp Dummy Variable: Training Data")
+```
+
+The bar chart above indicates that an extremely small share of the observations in our training data set display any part of a blue tarp; in fact, numerically speaking, only approximately three percent of the observations in the data set are classified as "Blue Tarp." As was discussed in Part 1, this asymmetry in the share of classifications impacts what metrics should be used to eventually evaluate each of the applied models.
+
+```{r}
+Blue_BP <- ggplot(Haiti, aes(x = Tarp, y = Blue)) +
+  geom_boxplot() +
+  labs(x = "Blue Tarp Dummy", y = "Blue Intensity")
+
+Red_BP <- ggplot(Haiti, aes(x = Tarp, y = Red)) +
+  geom_boxplot() +
+  labs(x = "Blue Tarp Dummy", y = "Red Intensity")
+
+Green_BP <- ggplot(Haiti, aes(x = Tarp, y = Green)) +
+  geom_boxplot() +
+  labs(x = "Blue Tarp Dummy", y = "Green Intensity")
+
+ggarrange(Blue_BP, Green_BP, Red_BP, ncol = 3, nrow = 1)
+```
+
+The leftmost box plot above indicates, unsurprisingly, that pixels displaying blue tarp generally have a significantly higher $Blue$ value than those displaying another one of the potential classes. It also makes sense that "Blue Tarp" observations generally have a higher $Green$ value than non-"Blue Tarp" observations (as indicated by the center plot above), simply given blue's similarity to green relative to other colors such as yellow or orange. In fact, this discovery in Part 1 led to including an interaction term between $Blue$ and $Green$ in each model; a pixel that visually appears blue may depend on also having a high value of $Green$ to look the way it does. Interestingly, the rightmost plot indicates virtually no difference between median $Red$ values in "Blue Tarp" and non-"Blue Tarp" observations. At the same time, however, it appears that most "Blue Tarp" observations are within a much narrower band of $Red$ values than non-"Blue Tarp" observations. Given the median $Red$ value of "Blue Tarp" observations is right in the middle of the range of potential values, this simply indicates that observations with extreme $Red$ values in either direction are extremely unlikely to be classified as "Blue Tarp."
+
+## Holdout Data
+
+```{r}
+NonBlue57 <- read.table("orthovnir057_ROI_NON_Blue_Tarps.txt", comment = ";", 
+                        col.names = c("ID", "X", "Y", "Map X", "Map Y", "Lat", 
+                                      "Lon", "B1", "B2",  "B3"))
+NonBlue57 <- NonBlue57[, -1]
+NonBlue57 <- NonBlue57 %>% mutate(Tarp = 0)
+
+Blue67 <- read.table("orthovnir067_ROI_Blue_Tarps.txt", comment = ";", 
+                        col.names = c("ID", "X", "Y", "Map X", "Map Y", "Lat", 
+                                      "Lon", "B1", "B2",  "B3"))
+Blue67 <- Blue67[, -1]
+Blue67 <- Blue67 %>% mutate(Tarp = 1)
+
+Blue67_2 <- read.table("orthovnir067_ROI_Blue_Tarps_data.txt", comment = ";", 
+                        col.names = c("B1", "B2",  "B3"))
+
+NonBlue67 <- read.table("orthovnir067_ROI_NOT_Blue_Tarps.txt", comment = ";", 
+                        col.names = c("ID", "X", "Y", "Map X", "Map Y", "Lat", 
+                                      "Lon", "B1", "B2",  "B3"))
+NonBlue67 <- NonBlue67[, -1]
+NonBlue67 <- NonBlue67 %>% mutate(Tarp = 0)
+
+Blue69 <- read.table("orthovnir069_ROI_Blue_Tarps.txt", comment = ";", 
+                        col.names = c("ID", "X", "Y", "Map X", "Map Y", "Lat", 
+                                      "Lon", "B1", "B2",  "B3"))
+Blue69 <- Blue69[, -1]
+Blue69 <- Blue69 %>% mutate(Tarp = 1)
+
+NonBlue69 <- read.table("orthovnir069_ROI_NOT_Blue_Tarps.txt", comment = ";", 
+                        col.names = c("ID", "X", "Y", "Map X", "Map Y", "Lat", 
+                                      "Lon", "B1", "B2",  "B3"))
+NonBlue69 <- NonBlue69[, -1]
+NonBlue69 <- NonBlue69 %>% mutate(Tarp = 0)
+
+Blue78 <- read.table("orthovnir078_ROI_Blue_Tarps.txt", comment = ";", 
+                        col.names = c("ID", "X", "Y", "Map X", "Map Y", "Lat", 
+                                      "Lon", "B1", "B2",  "B3"))
+Blue78 <- Blue78[, -1]
+Blue78 <- Blue78 %>% mutate(Tarp = 1)
+
+NonBlue78 <- read.table("orthovnir078_ROI_NON_Blue_Tarps.txt", comment = ";", 
+                        col.names = c("ID", "X", "Y", "Map X", "Map Y", "Lat", 
+                                      "Lon", "B1", "B2",  "B3"))
+NonBlue78 <- NonBlue78[, -1]
+NonBlue78 <- NonBlue78 %>% mutate(Tarp = 0)
+
+#(https://stackoverflow.com/a/27338295) for removing comments
+#(https://sparkbyexamples.com/r-programming/remove-column-in-r/?expand_article=1) for removing "ID" column
+```
+
+The holdout data for Part 2 of this project actually comes in the form of eight separate text files comprising multiple aerial photographs, and each file's name indicates whether the observations therein are "Blue Tarp" or non-"Blue Tarp" pixels; for example, one file is named "orthovnir057_ROI_NON_Blue_Tarps.txt" while another is named "orthovnir067_ROI_Blue_Tarps.txt." With the exception of one file, all tables contain the same ten columns, which will be evaluated later in this exploratory analysis. As such, the only data cleaning initially needed is removing the unnecessary $ID$ column for each observation and deleting the header metadata comments from each table; it is also necessary to add the categorical $Tarp$ variable to each table. Within each table, this $Tarp$ column contains either entirely "Blue Tarp" or "Other" observations based on the file name.
+
+It was just mentioned that all but one text file contain the same ten columns. The outlying file, named "orthovnir067_ROI_Blue_Tarps_data," simply contains three columns with red, green, and blue pixel values (which as of right now are yet to be properly labeled; they are ambiguously named $B1$, $B2$, and $B3$ like in the other seven tables). At first glance, this file could contain missing pixel color values for one of the other tables; however, the similarly-named "orthovnir067_ROI_Blue_Tarps" already exists with those three columns, and in fact also happens to feature the same number of rows. As such, it was necessary to verify whether this outlying file was actually needed, or whether it duplicated color values from the nearly-identically-named file.
+
+```{r}
+sum(Blue67$B1 == Blue67_2$B1)
+sum(Blue67$B2 == Blue67_2$B2)
+sum(Blue67$B3 == Blue67_2$B3)
+```
+
+Each number above represents the sum of boolean values for whether a respective $B1$, $B2$, or $B3$ value in "orthovnir067_ROI_Blue_Tarps_data" is identical to the corresponding observation in the same row in "orthovnir067_ROI_Blue_Tarps." Given that each file contains 4,446 rows, we can interpret these numbers as saying each aforementioned file has identical $B1$, $B2$, and $B3$ values in every single observation. Therefore, our three-column file is not needed as part of our holdout data set, and we can now concatenate the seven remaining files.
+
+```{r}
+HoldOut <- rbind(Blue67, Blue69, Blue78, NonBlue57, NonBlue67, NonBlue69, NonBlue78)
+#(https://stackoverflow.com/a/20081325) for concatenating the dataframes
+HoldOut$Tarp <- as.factor(HoldOut$Tarp)
+levels(HoldOut$Tarp) <- c('other', 'bluetarp')
+
+summary(HoldOut)
+```
+
+The fully-merged holdout data set contains 2,004,177 observations (pixels) with ten variables. The first two variables, $X$ and $Y$, refer to respective (X, Y) coordinate values of each pixel within its image, if the image is thought of as a grid of individual pixels with their own x-axis and y-axis position. $Map.X$ and $Map.Y$ refer to each pixel's (X, Y) coordinate values as part of the "projected coordinate system," which projects the earth onto a two-dimensional surface.[^3] $Lat$ and $Lon$ refer to each pixel's respective latitude and longitude in terms of its exact location on the earth's surface.
+
+[^3]: "Map Information in ENVI." *NV5 Geospatial*, www.nv5geospatialsoftware.com/docs/overviewmapinformationinenvi.html. Accessed 1 Aug. 2023.
+
+```{r}
+BP_1 <- ggplot(HoldOut, aes(x = Tarp, y = B1)) +
+  geom_boxplot() +
+  labs(x = "Blue Tarp Dummy", y = "B1 Intensity")
+
+BP_2 <- ggplot(HoldOut, aes(x = Tarp, y = B2)) +
+  geom_boxplot() +
+  labs(x = "Blue Tarp Dummy", y = "B2 Intensity")
+
+BP_3 <- ggplot(HoldOut, aes(x = Tarp, y = B3)) +
+  geom_boxplot() +
+  labs(x = "Blue Tarp Dummy", y = "B3 Intensity")
+
+ggarrange(BP_1, BP_2, BP_3, ncol = 3, nrow = 1)
+```
+
+The boxplots above represent the distribution of values for each pixel color variable across "other" and "bluetarp" categorizations within the $Tarp$ dummy variable in the holdout data set. Given what we know about the distributions of $Blue$, $Green$, and $Red$ in the training data, we can use these boxplots to properly label $B1$, $B2$, and $B3$. The leftmost boxplot shows a nearly identical distribution of the $B1$ color across tarp and non-tarp pixels, which very closely mirrors the distribution of $Red$ in the training data. Furthermore, the rightmost boxplot shows that the $B3$ color is much more prevalent in blue tarp pixels than non-tarp pixels; the 25th percentile value in tarp pixels is at least one third greater than the 75th percentile value in non-tarp pixels. This distribution very closely mirrors the distribution of $Blue$ in the training data. Lastly, the disparity between $B2$ values in tarp and non-tarp pixels falls right in between the other two color variables, as indicated by the middle boxplot above, which very closely mirrors the distribution of $Green$ in the training data. As such, we can conclude that $B1$ refers to the $Red$ color value, $B2$ refers to the $Green$ color value, and $B3$ refers to the $Blue$ color value in the holdout data.
+
+```{r}
+HoldOut <- HoldOut %>% rename('Red' = 'B1', 'Green' = 'B2', 'Blue' = 'B3')
+#(https://sparkbyexamples.com/r-programming/rename-column-in-r/?expand_article=1)
+```
+
+It should be noted that the numerical values of each color in the holdout data set seem to be low compared to those from the training data. For example, the median value of $Blue$ in tarp pixels in the training data is approximately 215, while the median value of $Blue$ in tarp pixels in the holdout data is just approximately 155. In fact, this difference of approximately 60 can be seen across each color variable in both tarp and non-tarp pixels between the data sets. Despite this numerical difference, however, the actual proportional distribution of each color between tarp and non-tarp pixels in each data set is very similar, as seen in both sets of box plots above. As such, I do not expect this finding to have a significant impact on the eventual results of this analysis; methods which perform well or poorly on the training data should perform to a similarly well or poorly on the holdout data.
+
+```{r}
+ggplot(HoldOut, aes(x = Tarp)) +
+  geom_bar() +
+  labs(x = "Blue Tarp Dummy", y = "Count", title = "Distribution of Blue Tarp Dummy Variable: Holdout Data")
+```
+
+The bar chart above shows that, like in the training data set, there is significant imbalance in the share of tarp and non-tarp pixels. In fact, there is an even smaller share of tarp pixels in the holdout data (14,480/2,004,177 = .722%) than in the training data. Although it was already the case, this reasserts the importance of evaluating models with metrics other than pure accuracy; if each of the models tested blindly assigns every single value in the holdout data to "other," it would have a nearly perfect accuracy (100 - .722 = 99.278%).
+
+```{r}
+pairs(HoldOut[, 7:9], lower.panel = NULL)
+```
+
+```{r}
+HoldOut <- HoldOut %>% mutate(logRed = log(Red))
+HoldOut <- HoldOut %>% mutate(logGreen = log(Green))
+HoldOut <- HoldOut %>% mutate(logBlue = log(Blue))
+pairs(HoldOut[, 11:13], lower.panel = NULL)
+```
+
+In each of the two scatterplot matrices above, the overall "shape" of the data is more important than being able to visualize the observations themselves. With that in mind, these matrices show that the pixel color variables in the holdout data set mirror those of the training data; each variable is fairly strongly correlated with one another, and the issue of heteroscedastic-like relationships appear to be solved after log-transforming each variable.
+
+# 3. Model Fitting, Tuning Parameter Selection, and Evaluation
+
+Our approach with respect to model building will mirror that from this project's Part One. We will use logistic regression, LDA, QDA, KNN, penalized logistic regression, and now random forests and support vector machines on two different models. One model will regress $Tarp$ against $Red$, $Green$, $Blue$ and an interaction term between $Blue$ and $Green$, and the other will do the exact same thing with the log of each of those predictors. As was established in Part One and mentioned again in the Exploratory Data Analysis section here, it makes sense to include an interaction term under the presumption that higher values of green, given its similarity to the color blue compared to red, contribute to a pixel's overall "blueness." As was the case in Part One, these models will remain consistent throughout each of the modeling methods tested, as I simply believe further feature selection or subset selection is unnecessary; there is a particularly small number of possible predictors to begin with, and the only unique variables between the training and holdout data are the color variables and response variable.
+
+Formula 1: $Tarp$ = $\beta_0$ + $\beta_1$$Red$ + $\beta_2$$Green$ + $\beta_3$$Blue$ + $\beta_4$$Blue$\*$Green$
+
+Formula 2: $Tarp$ = $\beta_0$ + $\beta_1$$logRed$ + $\beta_2$$logGreen$ + $\beta_3$$logBlue$ + $\beta_4$$logBlue$$logGreen$
+
+Like in Part One, 10-fold cross-validation will be used to evaluate the performance of each of our models within each modeling method. Accuracy, sensitivity, false positive rate (FPR), and precision are metrics of particular importance to us to select an optimal model. ROC curves and the AUC value will also be shown for each specific model within each modeling method. After each model is evaluated and tuned using 10-fold cross-validation on the training set, the "optimal" model from each method will be reevaluated on the holdout data set.
+
+The methodology for evaluating each modeling technique remains as it was in Part One. Contextually speaking, we want our optimal model to minimize the number of times it incorrectly establishes an observation as "Other" when it is actually a "Blue Tarp" pixel. In practice, categorizing a pixel incorrectly as "Other" and sharing this information with other rescue efforts means that displaced people go unnoticed, simply because no one thinks they exist. Although resources are limited in actuality, it would be preferred to "play it safe" and overestimate the number of observations that are "Blue Tarp;" if every effort is made to visit as many "Blue Tarp" locations as possible, we at least want *all actual* blue tarps to be within our denominator of searched locations, even if a fair number of places do not actually feature a blue tarp. In other words, as a matter of risk aversion, I consider it better to search an area and find out there are no blue tarps (and therefore people) than never search an area at all and potentially forego finding displaced people. As such, it is important to select a model with a higher sensitivity; the higher a model's sensitivity, the less often it categorizes a "Blue Tarp" pixel incorrectly as "Other," causing it to go unnoticed in practice. Overall, given the real-life context of our analysis, it is crucial that no stone gets left un-turned in our rescue efforts (especially given the lack of knowledge about the resources available to the rescue efforts; we can somewhat reasonably suspend worry about needing to efficiently allocate a known number of rescuers, for example.)
+
+This analysis uses the "Caret" package in R for all processes directly related to model execution carried out below (i.e. setting up cross-validation, running each model, calculating performance metrics, parameter tuning) unless otherwise specified.
+
+For the sake of brevity, the definitions and explanations of each statistical method already used in Part One will not be repeated in Part 2. Similarly, in some cases within a cross-validation subsection, a plot, table, or value already seen in Part One may be left without commentary.
+
+## Logistic Regression
+
+### Cross-validation
+
+For logisitc regression, it is necessary to save both the classifications for each observation following validation, as well as the estimated probabilities associated with those classifications. Saving these values allows us to use multiple model efficacy metrics at different thresholds which compare each model's results to our known, actual response observations.
+
+```{r}
+set.seed(42)
+Validation <- trainControl(method = "repeatedcv", number = 10, classProbs = TRUE, savePredictions = TRUE)
+#(https://topepo.github.io/caret/model-training-and-tuning.html#basic-parameter-tuning)
+      
+base_lr <- train(Tarp ~ Red + Green + Blue + Blue*Green, data = Haiti, method = 'glm', family = 'binomial', trControl = Validation)
+
+log_lr <- train(Tarp ~ logRed + logGreen + logBlue + logBlue*logGreen, data = Haiti, method = 'glm', family = 'binomial', trControl = Validation)
+
+base_threshold_lr <- thresholder(base_lr, threshold = seq(0.05, 0.95, by = 0.05), statistics = "all")
+
+log_threshold_lr <- thresholder(log_lr, threshold = seq(0.05, 0.95, by = 0.05), statistics = "all")
+
+base_threshold_lr$FNR <- 1 - base_threshold_lr$Sensitivity
+base_threshold_lr$FPR <- 1 - base_threshold_lr$Specificity
+
+log_threshold_lr$FNR <- 1 - log_threshold_lr$Sensitivity
+log_threshold_lr$FPR <- 1 - log_threshold_lr$Specificity
+
+table1 <-base_threshold_lr %>% select("prob_threshold", "Accuracy", "Sensitivity", "FPR", "Precision", "Dist") %>% kable(digits = 3) %>% kable_styling(full_width = FALSE)
+
+table1
+```
+
+The table above shows us our model effectiveness metrics at each threshold for logistic regression of our "Formula 1" after using cross-validation. We see that sensitivity is unsurprisingly maximized at our lowest threshold, but there is also a very significant decrease in precision. At the next-lowest threshold (.1), we see only a marginal decrease in sensitivity but a significant improvement in precision, from .770 to .864. The same can be said at the .15 threshold, but after that the increase in precision plateaus. Given this fact and what we previously established about risk aversion when classifying blue tarps, we will compare the logistic regression of "Formula 1" at the .15 threshold to our logistic regression of "Formula 2," discussed below. The trade-off in sensitivity for marginally better precision as the threshold increases past .15 is not worth potentially missing more blue tarps because they were classified as "Other."
+
+```{r}
+set.seed(42)
+base_lr_prediction <- predict(base_lr, Haiti, type = 'prob')
+base_lr_observations <- prediction(base_lr_prediction$bluetarp, Haiti$Tarp, label.ordering = c('other', 'bluetarp'))
+base_lr_roc <- performance(base_lr_observations, measure = 'tpr', x.measure = 'fpr')
+plot(base_lr_roc, colorize = T, print.cutoffs.at = c(0, 0.1, 0.9, 1.0), xlim = c(0, .1), ylim = c(.8, 1), main = "ROC Curve for Base Logistic Regression: Cross-Validation")
+lines(x = c(0,1), y = c(0,1), col = 'grey')
+```
+
+```{r}
+base_lr_AUC <- performance(base_lr_observations, "auc")@y.values[[1]]
+base_lr_AUC
+```
+
+```{r}
+table2 <- log_threshold_lr %>% select("prob_threshold", "Accuracy", "Sensitivity", "FPR", "Precision", "Dist") %>% kable(digits = 3) %>% kable_styling(full_width = FALSE)
+
+table2
+```
+
+The table above shows us our model effectiveness metrics at each threshold for logistic regression of our "Formula 2." Similar to our previous threshold table, we see a point where our precision metric improves significantly from one threshold to the next before leveling off, which here is at .15. Just like with our logistic regression of "Formula 1," we want to maximize both our precision and sensitivity, but avoid trading off too much sensitivity for more precision. As such, we will select .15 as our optimal threshold for this logistic application of "Formula 2" using cross-validation.
+
+```{r}
+set.seed(42)
+log_lr_prediction <- predict(log_lr, Haiti, type = 'prob')
+log_lr_observations <- prediction(log_lr_prediction$bluetarp, Haiti$Tarp, label.ordering = c('other', 'bluetarp'))
+log_lr_roc <- performance(log_lr_observations, measure = 'tpr', x.measure = 'fpr')
+plot(log_lr_roc, colorize = T, print.cutoffs.at = c(0, 0.1, 0.9, 1.0), xlim = c(0, .1), ylim = c(.8, 1), main = "ROC Curve for Logistic Regression w/ Log Predictors: Cross-Validation")
+lines(x = c(0,1), y = c(0,1), col = 'grey')
+```
+
+```{r}
+log_lr_AUC <- performance(log_lr_observations, "auc")@y.values[[1]]
+log_lr_AUC
+```
+
+As was the case with our previous logistic regression, the ROC and AUC indicate extremely strong performance of our model. In both cases, our AUC has been extremely close to one (greater than .999, specifically.).
+
+Ultimately, the performance of logistic regression on each of our formulas at their selected thresholds is extremely similar. Our metrics for "Formula 1" at the .15 threshold are 0.996 accuracy, 0.970 sensitivity, 0.003 FPR, and 0.911 precision. For "Formula 2" at the .15 threshold, the same metrics are 0.996, 0.971, 0.003, and 0.914, respectively. Overall, given "Formula 2's" precision rate and sensitivity is higher than that of "Formula 1," **we will select "Formula 2" at a .15 threshold as the optimal logistic regression model from our cross-validation analysis.**
+
+### Holdout Testing
+
+We will now apply the selected logistic regression model from cross-validation to our holdout data set. We first plot an updated ROC curve based on the model's predictions on the holdout set, and then calculate our various performance metrics at the selected threshold from cross-validation. The ROC curve is downsampled to include only .1% of the holdout data for the sake of runtime.
+
+```{r}
+set.seed(42)
+holdout_lr_prediction <- predict(log_lr, HoldOut, type = 'prob')
+holdout_lr_observations <- prediction(holdout_lr_prediction$bluetarp, HoldOut$Tarp, label.ordering = c('other', 'bluetarp'))
+holdout_lr_roc <- performance(holdout_lr_observations, measure = 'tpr', x.measure = 'fpr')
+plot(holdout_lr_roc, colorize = T, print.cutoffs.at = c(0, 0.1, 0.9, 1.0), xlim = c(0, .1), ylim = c(.8, 1), main = "ROC Curve for Logistic Regression w/ Log Predictors: Holdout", downsampling = .001)
+lines(x = c(0,1), y = c(0,1), col = 'grey')
+```
+
+```{r}
+holdout_lr_AUC <- performance(holdout_lr_observations, "auc")@y.values[[1]]
+holdout_lr_AUC
+```
+
+Based on the ROC curve and AUC directly above, we see a marginal improvement in the performance of logistic regression on the holdout set. AUC increases from .9994077 on the training data to .9994343 here.
+
+```{r}
+test1 = rep("other", 2004177)
+test1[holdout_lr_prediction$bluetarp > .15] = "bluetarp"
+test1 <- data.frame(test1)
+colnames(test1)[1] = "Tarp"
+#https://sparkbyexamples.com/r-programming/rename-column-in-r/
+
+test1$Tarp <- as.factor(test1$Tarp)
+levels(test1$Tarp) <- c('bluetarp', 'other')
+```
+
+```{r}
+confusionMatrix(data = test1$Tarp, reference = HoldOut$Tarp, positive = "bluetarp")
+```
+
+Despite an extremely strong sensitivity, our optimal logistic regression tested on the holdout data shows an extremely poor precision ("Pos Pred Value" above). In other words, logistic regression captures nearly all blue tarps in the holdout data, but also falsely captures a much larger share of non-tarps.[^4] Although there is no concretely acceptable precision value in the context of our real-world problem, it is safe to say a near-perfect sensitivity is not worth the trade-off of so many "false alarms." Further discussion about this senstivity/precision disparity takes place later.
+
+[^4]: "Project Preview: Starting the Disaster Relief Project," "Additional Resources: extremely important practical stuff," "Sensitivity/Specificity and Recall/Precision," DS 6030 Module 3
+
+## Linear Discriminant Analysis
+
+### Cross-validation
+
+```{r}
+set.seed(42)
+base_lda <- train(Tarp ~ Red + Green + Blue + Blue*Green, data = Haiti, method = 'lda', trControl = Validation)
+
+log_lda <- train(Tarp ~ logRed + logGreen + logBlue + logBlue*logGreen, data = Haiti, method = 'lda', trControl = Validation)
+
+base_lda_threshold <- thresholder(base_lda, threshold = seq(0.05, 0.95, by = 0.05), statistics = "all")
+
+log_lda_threshold <- thresholder(log_lda, threshold = seq(0.05, 0.95, by = 0.05), statistics = "all")
+
+base_lda_threshold$FNR <- 1 - base_lda_threshold$Sensitivity
+base_lda_threshold$FPR <- 1 - base_lda_threshold$Specificity
+
+log_lda_threshold$FNR <- 1 - log_lda_threshold$Sensitivity
+log_lda_threshold$FPR <- 1 - log_lda_threshold$Specificity
+
+table3 <- base_lda_threshold %>% select("prob_threshold", "Accuracy", "Sensitivity", "FPR", "Precision", "Dist") %>% kable(digits = 3) %>% kable_styling(full_width = FALSE)
+
+table3
+```
+
+The table above shows us our model effectiveness metrics at each threshold for LDA applied to our "Formula 1." We can see, just like with our logistic regressions, precision increases significantly from one threshold to the next before relatively leveling off. Here, precision increases by .055 from the .1 to .15 thresholds, with a corresponding decrease in sensitivity of .01. After that threshold, however, sensitivity continues to decrease at a consistent rate without any more significant jumps in precision. As such, our optimal threshold for LDA applied to "Formula 1" will be .15.
+
+```{r}
+set.seed(42)
+base_lda_prediction <- predict(base_lda, Haiti, type = 'prob')
+base_lda_observations <- prediction(base_lda_prediction$bluetarp, Haiti$Tarp, label.ordering = c('other', 'bluetarp'))
+base_lda_roc <- performance(base_lda_observations, measure = 'tpr', x.measure = 'fpr')
+plot(base_lda_roc, colorize = T, print.cutoffs.at = c(0, 0.1, 0.9, 1.0), xlim = c(0, .1), ylim = c(.8, 1), main = "ROC Curve for Base LDA: Cross-Validation")
+lines(x = c(0,1), y = c(0,1), col = 'grey')
+```
+
+```{r}
+base_lda_AUC <- performance(base_lda_observations, "auc")@y.values[[1]]
+base_lda_AUC
+```
+
+Our AUC above can be said to be a few "thousandths" worse than those from our logistic regressions, which had values greater than .999, even approaching or clearing .9995.
+
+```{r}
+table4 <- log_lda_threshold %>% select("prob_threshold", "Accuracy", "Sensitivity", "FPR", "Precision", "Dist") %>% kable(digits = 3) %>% kable_styling(full_width = FALSE)
+
+table4
+```
+
+Interestingly, the sensitivities for our LDA applied to "Formula 2," as shown above, are notably higher than those from LDA applied to "Formula 1." This immediately indicates that LDA applied to "Formula 2" is a much stronger application of this statistical method than when used on "Formula 1." When it comes to threshold selection, we can again see the pattern of a significant jump in precision before it plateaus, which here seems to occur at the .15 threshold; as such, we will select .15 as our optimal threshold for LDA applied to "Formula 2".
+
+```{r}
+set.seed(42)
+log_lda_prediction <- predict(log_lda, Haiti, type = 'prob')
+log_lda_observations <- prediction(log_lda_prediction$bluetarp, Haiti$Tarp, label.ordering = c('other', 'bluetarp'))
+log_lda_roc <- performance(log_lda_observations, measure = 'tpr', x.measure = 'fpr')
+plot(log_lda_roc, colorize = T, print.cutoffs.at = c(0, 0.1, 0.9, 1.0), xlim = c(0, .1), ylim = c(.8, 1), main = "ROC Curve for LDA with Log of Predictors: Cross-Validation")
+lines(x = c(0,1), y = c(0,1), col = 'grey')
+```
+
+```{r}
+log_lda_AUC <- performance(log_lda_observations, "auc")@y.values[[1]]
+log_lda_AUC
+```
+
+Given the notably better performance of LDA on "Formula 2" relative to "Formula 1," it is unsurprising that the ROC curve and AUC directly above fall much more in line with those from our logistic regression. Given this fact, **we will select "Formula 2" at a .15 threshold as the optimal LDA application from our cross-validation analysis.** The effectiveness of our log-transformed model within LDA can perhaps be attributed to the fact that those transformations "linearize" the data, as seen in the scatterplot matrices within Section 2; after all, the literal "discriminant" functions used as part of LDA are linear.[^5]
+
+[^5]: James, Gareth, et al. *An Introduction to Statistical Learning with Applications in R*. 2nd ed., Springer Nature, 2021., pp. 145
+
+### Holdout Testing
+
+We will now apply the selected LDA model from cross-validation to our holdout data set. We first plot an updated ROC curve based on the model's predictions on the holdout set, and then calculate our various performance metrics at the selected threshold from cross-validation. The ROC curve is downsampled to include only .1% of the holdout data for the sake of runtime.
+
+```{r}
+set.seed(42)
+holdout_lda_prediction <- predict(log_lda, HoldOut, type = 'prob')
+holdout_lda_observations <- prediction(holdout_lda_prediction$bluetarp, HoldOut$Tarp, label.ordering = c('other', 'bluetarp'))
+holdout_lda_roc <- performance(holdout_lda_observations, measure = 'tpr', x.measure = 'fpr')
+plot(holdout_lda_roc, colorize = T, print.cutoffs.at = c(0, 0.1, 0.9, 1.0), xlim = c(0, .1), ylim = c(.8, 1), main = "ROC Curve for LDA w/ Log Predictors: Holdout", downsampling = .001)
+lines(x = c(0,1), y = c(0,1), col = 'grey')
+```
+
+```{r}
+holdout_lda_AUC <- performance(holdout_lda_observations, "auc")@y.values[[1]]
+holdout_lda_AUC
+```
+
+Based on the ROC curve and AUC directly above, we see a marginal improvement in the performance of LDA on the holdout set. AUC increases from .9992071 on the training data to .9995744 here, which is also better than the same value for our logistic regression model applied to the holdout data set.
+
+```{r}
+test2 = rep("other", 2004177)
+test2[holdout_lda_prediction$bluetarp > .15] = "bluetarp"
+test2 <- data.frame(test2)
+colnames(test2)[1] = "Tarp"
+#https://sparkbyexamples.com/r-programming/rename-column-in-r/
+
+test2$Tarp <- as.factor(test2$Tarp)
+```
+
+```{r}
+confusionMatrix(data = test2$Tarp, reference = HoldOut$Tarp, positive = "bluetarp")
+```
+
+The performance of our optimal LDA model on the holdout set mirrors the performance of our optimal logistic regression on the holdout set. That is, sensitivity at the optimal threshold improves greatly towards 1, but precision falls very significantly. The precision above is over .15 higher than that of logistic regression, but still well below our standard from cross-validation.
+
+## Quadratic Discriminant Analysis
+
+### Cross-validation
+
+```{r}
+set.seed(42)
+base_qda <- train(Tarp ~ Red + Green + Blue + Blue*Green, data = Haiti, method = 'qda', trControl = Validation)
+
+log_qda <- train(Tarp ~ logRed + logGreen + logBlue + logBlue*logGreen, data = Haiti, method = 'qda', trControl = Validation)
+
+base_qda_threshold <- thresholder(base_qda, threshold = seq(0.05, 0.95, by = 0.05), statistics = "all")
+
+log_qda_threshold <- thresholder(log_qda, threshold = seq(0.05, 0.95, by = 0.05), statistics = "all")
+
+base_qda_threshold$FNR <- 1 - base_qda_threshold$Sensitivity
+base_qda_threshold$FPR <- 1 - base_qda_threshold$Specificity
+
+log_qda_threshold$FNR <- 1 - log_qda_threshold$Sensitivity
+log_qda_threshold$FPR <- 1 - log_qda_threshold$Specificity
+
+table5 <- base_qda_threshold %>% select("prob_threshold", "Accuracy", "Sensitivity", "FPR", "Precision", "Dist") %>% kable(digits = 3) %>% kable_styling(full_width = FALSE)
+
+table5
+```
+
+We can immediately see from the table above that our "Formula 1" applied to QDA results in very poor precision relative to our previous models; it is not until a threshold of .90 that precision exceeds .900. Interestingly, despite the very wide range in precision across thresholds, this does not correspond to an equally wide range in sensitivity. While precision ranges from .535 to .978 across thresholds, the corresponding sensitivities only range from .956 to .853. As such, we can afford to select a high threshold for this model without worrying about our sensitivity completely cratering. Unlike for previous models, the trade-off of precision for maximum sensitivity is too severe; in practice, choosing a low threshold would result in a multitude of rescue searches coming up empty. As such, it appears that the optimal threshold for this model is our maximum threshold of .95; we see a significant jump in precision from thresholds even .1 lower, and our sensitivity still shows that false negatives occur only about fourteen percent of the time. In fact, the maximum threshold's precision of .978 is so high that it can be argued it completely flips our original scale; at this threshold, we know that even if we forego searching areas where they may be survivors, we are simultaneously much, much more likely to find people in the places we do look. It flips the perspective of "risk aversion" previously established completely on its head.
+
+```{r}
+set.seed(42)
+base_qda_prediction <- predict(base_qda, Haiti, type = 'prob')
+base_qda_observations <- prediction(base_qda_prediction$bluetarp, Haiti$Tarp, label.ordering = c('other', 'bluetarp'))
+base_qda_roc <- performance(base_qda_observations, measure = 'tpr', x.measure = 'fpr')
+plot(base_qda_roc, colorize = T, print.cutoffs.at = c(0, 0.1, 0.9, 1.0), xlim = c(0, .1), ylim = c(.8, 1), main = "ROC Curve for Base QDA: Cross-Validation")
+lines(x = c(0,1), y = c(0,1), col = 'grey')
+```
+
+```{r}
+base_qda_AUC <- performance(base_qda_observations, "auc")@y.values[[1]]
+base_qda_AUC
+```
+
+Given this application of QDA did not perform as well as other tested models in terms of sensitivity, it is unsurprising to see the ROC Curve and AUC above fall more in line with those of the application of LDA to "Formula 1," which struggled very similarly.
+
+```{r}
+table6 <- log_qda_threshold %>% select("prob_threshold", "Accuracy", "Sensitivity", "FPR", "Precision", "Dist") %>% kable(digits = 3) %>% kable_styling(full_width = FALSE)
+
+table6
+```
+
+The table above indicates that QDA applied to "Formula 2" sees much better sensitivities and precisions compared to its previous application to "Formula 1." While the range of precisions above is still relatively high, it is less than in the previous table, and the corresponding sensitivities are much higher at any given precision point. As such, to select the optimal threshold for this model, we can go back to the original approach of looking at where precision seems to level off and the subsequent trade-offs of sensitivity are not worth the marginal increase in precision. It appears that that threshold for this application of QDA to "Formula 2" is at .30, where precision increases by almost .02 from the previous threshold but sensitivity only decreases by .003. What's more, that sensitivity in it of itself is still above .960.
+
+```{r}
+set.seed(42)
+log_qda_prediction <- predict(log_qda, Haiti, type = 'prob')
+log_qda_observations <- prediction(log_qda_prediction$bluetarp, Haiti$Tarp, label.ordering = c('other', 'bluetarp'))
+log_qda_roc <- performance(log_qda_observations, measure = 'tpr', x.measure = 'fpr')
+plot(log_qda_roc, colorize = T, print.cutoffs.at = c(0, 0.1, 0.9, 1.0), xlim = c(0, .1), ylim = c(.8, 1), main = "ROC Curve for QDA of Log of Predictors: Cross-Validation")
+lines(x = c(0,1), y = c(0,1), col = 'grey')
+```
+
+```{r}
+log_qda_AUC <- performance(log_qda_observations, "auc")@y.values[[1]]
+log_qda_AUC
+```
+
+The ROC Curve and AUC above reinforce the fact that QDA applied to "Formula 2" is a much stronger model than QDA applied to "Formula 1." The difference in AUC from the former to the latter is over two-thousandths (relatively significant at these values of AUC because of classification skew). As such, **we will select "Formula 2" at a .30 threshold as the optimal QDA application from our cross-validation analysis.**
+
+### Holdout Testing
+
+We will now apply the selected QDA model from cross-validation to our holdout data set. We first plot an updated ROC curve based on the model's predictions on the holdout set, and then calculate our various performance metrics at the selected threshold from cross-validation. The ROC curve is downsampled to include only .1% of the holdout data for the sake of runtime.
+
+```{r}
+set.seed(42)
+holdout_qda_prediction <- predict(log_qda, HoldOut, type = 'prob')
+holdout_qda_observations <- prediction(holdout_qda_prediction$bluetarp, HoldOut$Tarp, label.ordering = c('other', 'bluetarp'))
+holdout_qda_roc <- performance(holdout_qda_observations, measure = 'tpr', x.measure = 'fpr')
+plot(holdout_qda_roc, colorize = T, print.cutoffs.at = c(0, 0.1, 0.9, 1.0), xlim = c(0, .1), ylim = c(.7, 1), main = "ROC Curve for QDA w/ Log Predictors: Holdout", downsampling = .001)
+lines(x = c(0,1), y = c(0,1), col = 'grey')
+```
+
+```{r}
+holdout_qda_AUC <- performance(holdout_qda_observations, "auc")@y.values[[1]]
+holdout_qda_AUC
+```
+
+Interestingly, both the ROC curve and AUC value indicate that QDA applied to "Formula 2" performs worse on the holdout data set than on the training data. Specifically, the AUC decreases from .9991143 to the value directly above. As was the case in cross-validation, QDA performs worse than both logistic regression and LDA, which may simply be due to the fact that both of our data sets have variables with a linear "shape," especially after being log-transformed, as is the case in our optimal QDA model. As detailed in Part One, the formula within QDA which helps to classify observations is quadratic rather than linear.[^6]
+
+[^6]: Ibid. pp. 143, 146, 153
+
+```{r}
+test3 = rep("other", 2004177)
+test3[holdout_qda_prediction$bluetarp > .30] = "bluetarp"
+test3 <- data.frame(test3)
+colnames(test3)[1] = "Tarp"
+#https://sparkbyexamples.com/r-programming/rename-column-in-r/
+
+test3$Tarp <- as.factor(test3$Tarp)
+```
+
+```{r}
+confusionMatrix(data = test3$Tarp, reference = HoldOut$Tarp, positive = "bluetarp")
+```
+
+Our QDA model applied to the holdout data set may be the worst-performing model evaluated by the holdout data yet. While precision is the highest value we have seen so far (.379), it is still well below our typical cross-validation performance, and sensitivity falls to a value well-below those seen within cross-validation as well (.855)
+
+## K-Nearest Neighbors
+
+### Cross-validation
+
+It should be noted that for KNN, our data is scaled to avoid issues with the size of values in our predictor variables, as values are across multiple orders of magnitude. This is particularly impactful for distance-based statistical methods, as higher-magnitude observations can skew the results of analysis; as such, it is necessary to normalize our predictor variables by subtracting the mean of each predictor from each of its observations, and then dividing each predictor's observation by that variable's standard deviation.[^7][^8]
+
+[^7]: Sharma, Pulkit. "Why Is Scaling Required in KNN and K-Means?" *Medium*, 25 Aug. 2019, medium.com/analytics-vidhya/why-is-scaling-required-in-knn-and-k-means-8129e4d88ed7.
+
+[^8]: caret's "preProcess" R Documentation
+
+```{r}
+set.seed(42)
+knn_validation <- trainControl(method = "repeatedcv", number = 10, classProbs = TRUE, savePredictions = TRUE, summaryFunction = twoClassSummary)
+
+tunegrid <- data.frame(k = seq(1, 15, by = 2))
+
+Scaling <- preProcess(Haiti, method = c("center", "scale"))
+Scaled_Haiti <- predict(Scaling, Haiti)
+#(https://topepo.github.io/caret/pre-processing.html#centering-and-scaling)  
+                           
+base_knn <- train(Tarp ~ Red + Green + Blue + Blue*Green, data = Scaled_Haiti, method = 'knn', trControl = knn_validation, tuneGrid = tunegrid, metric = "ROC")
+
+base_knn
+```
+
+We can see from the output above that within our range of potential K-values, the value with the highest "ROC" is 15; as such, that will be the K-value we will use for our KNN applied to "Formula 1."
+
+```{r}
+set.seed(42)
+
+#base_knn_15 <- train(Tarp ~ Red + Green + Blue + Blue*Green, data = Scaled_Haiti, trControl = knn_validation, k = 15, metric = "ROC")
+
+base_knn_threshold <- thresholder(base_knn, threshold = seq(0.05, 0.95, by = 0.05), statistics = "all")
+
+base_knn_threshold$FNR <- 1 - base_knn_threshold$Sensitivity
+base_knn_threshold$FPR <- 1 - base_knn_threshold$Specificity
+
+table7 <- base_knn_threshold %>% select("prob_threshold", "Accuracy", "Sensitivity", "FPR", "Precision", "Dist") %>% kable(digits = 3) %>% kable_styling(full_width = FALSE)
+
+table7
+```
+
+The table above shows extremely strong performance of our KNN applied to "Formula 1" relative to previously-used models. Precision ranges from a low of only .767 to nearly the maximum value of 1, and sensitivity remains above .900 for all thresholds at .75 and below. In fact, even at a sensitivity of over .950, precision only falls to .949 from .996, its value at the highest threshold. Given this fact, we can afford to prioritize sensitivity, as is our preference, without significantly hindering precision. By that logic, I will select .30 as the optimal threshold for this model; sensitivity at that threshold is an exceptional .980, and we keep precision above the (admittedly arbitrary) .900 value by .02.
+
+```{r}
+set.seed(42)
+knn_prediction <- prediction(predict(base_knn, Scaled_Haiti, type = "prob")$bluetarp, Scaled_Haiti$Tarp, label.ordering = c('other', 'bluetarp'))
+
+knn_observations <- performance(knn_prediction, measure = 'tpr', x.measure = 'fpr')
+
+plot(knn_observations, colorize = T, print.cutoffs.at = c(0, 0.1, 0.9, 1.0), xlim = c(0, .1), ylim = c(.7, 1), main = "ROC Curve for Base KNN with K = 15: Cross-Validation")
+lines(x = c(0,1), y = c(0,1), col = 'grey')
+```
+
+```{r}
+set.seed(42)
+log_knn <- train(Tarp ~ logRed + logGreen + logBlue + logBlue*logGreen, data = Scaled_Haiti, method = 'knn', trControl = knn_validation, tuneGrid = tunegrid, metric = "ROC")
+
+log_knn
+```
+
+We can see from the output above that within our range of potential K-values, the value with the highest "ROC" is 15; as such, that will be the K-value we will use for our KNN applied to "Formula 2."
+
+```{r}
+set.seed(42)
+
+#log_knn_15 <- train(Tarp ~ logRed + logGreen + logBlue + logBlue*logGreen, data = Scaled_Train, method = 'kknn', trControl = knn_validation, k = 15, metric = "ROC")
+
+log_knn_threshold <- thresholder(log_knn, threshold = seq(0.05, 0.95, by = 0.05), statistics = "all")
+
+log_knn_threshold$FNR <- 1 - log_knn_threshold$Sensitivity
+log_knn_threshold$FPR <- 1 - log_knn_threshold$Specificity
+
+table8 <- log_knn_threshold %>% select("prob_threshold", "Accuracy", "Sensitivity", "FPR", "Precision", "Dist") %>% kable(digits = 3) %>% kable_styling(full_width = FALSE)
+
+table8
+```
+
+Once again, we see particularly strong performance for KNN, this time applied to "Formula 2." Precision ranges from .767 to .998, and sensitivity is greater than .900 at all thresholds up-to-and-including .75. Given these facts and this table's similarity to our previous KNN table, we will select .30 as a similarly low optimal threshold, this time of course applied to "Formula 2." At this threshold, precision has increased by .023 from a threshold of .15, while sensitivity has simultaneously decreased by only .004. Furthermore, that decrease still results in an extremely impressive sensitivity of .980.
+
+```{r}
+set.seed(42)
+knn_log_prediction <- prediction(predict(log_knn, Scaled_Haiti, type = "prob")$bluetarp, Scaled_Haiti$Tarp, label.ordering = c('other', 'bluetarp'))
+
+knn_log_observations <- performance(knn_log_prediction, measure = 'tpr', x.measure = 'fpr')
+
+plot(knn_log_observations, colorize = T, print.cutoffs.at = c(0, 0.1, 0.9, 1.0), xlim = c(0, .1), ylim = c(.8, 1), main = "ROC Curve for KNN with Log of Predictors with K = 15: Cross-Validation")
+lines(x = c(0,1), y = c(0,1), col = 'grey')
+```
+
+Ultimately, KNN performed extremely well on each of our formulas. In fact, our metrics for both formulas at the .30 threshold are identical: 0.997 accuracy, 0.980 sensitivity, 0.003 FPR, and 0.920 precision. The only difference between the two formulas is a "Dist" difference of .001 in favor of Formula 2. Therefore, **we will select "Formula 2" at a .30 threshold as the optimal KNN application from our cross-validation analysis.**
+
+### Holdout Testing
+
+We will now apply the selected KNN model from cross-validation to our holdout data set. We first plot an updated ROC curve based on the model's predictions on the holdout set, and then calculate our various performance metrics at the selected threshold from cross-validation. The ROC curve for KNN here is created using a different library, `pROC`, due to a difference in the gathering of predictions for KNN relative to previous models which causes an issue with the function used for all other ROC curves.
+
+```{r}
+set.seed(42)
+
+Scaling_2 <- preProcess(HoldOut, method = c("center", "scale"))
+Scaled_HoldOut <- predict(Scaling_2, HoldOut)
+
+holdout_knn_prediction <- prediction(predict(log_knn, Scaled_HoldOut, type = 'prob')$bluetarp, Scaled_HoldOut$Tarp, label.ordering = c('other', 'bluetarp'))
+
+test_predict <- predict(log_knn, Scaled_HoldOut, type = 'prob')
+
+rocobj <- roc(Scaled_HoldOut$Tarp, test_predict$bluetarp)
+auc <- round(auc(Scaled_HoldOut$Tarp, test_predict$bluetarp), 7)
+ggroc(rocobj) +
+  ggtitle(paste0('ROC Curve ROC Curve for KNN with Log of Predictors with K = 15: Holdout'))
+#https://www.statology.org/roc-curve-ggplot2/
+```
+
+```{r}
+auc
+```
+
+While still strong, this AUC value is a downgrade from the same value for the optimal KNN model applied to the training data, which was .9994970. The findings from the confusion matrix below and subsequent conjecture shed more light on why this may be the case.
+
+```{r}
+test4 = rep("other", 2004177)
+test4[test_predict$bluetarp > .30] = "bluetarp"
+test4 <- data.frame(test4)
+colnames(test4)[1] = "Tarp"
+#https://sparkbyexamples.com/r-programming/rename-column-in-r/
+
+test4$Tarp <- as.factor(test4$Tarp)
+```
+
+```{r}
+confusionMatrix(data = test4$Tarp, reference = Scaled_HoldOut$Tarp, positive = "bluetarp")
+```
+
+Interestingly, the sensitivity value for KNN is far worse when KNN is applied to the holdout set as compared to its application to the training data. Sensitivity falls to .9461 from .980 on the optimal KNN model as trained via cross-validation. Not only that, but this model's precision on the holdout data is the worst seen from any holdout-tested models yet, at .111. Perhaps the sheer size of the holdout data set combined with the fact that many more pixel color values in the set are statistical outliers (as shown by the holdout data's boxplots in Section 2) means that a k-value of 15 is too small to correctly predict pixel classes as frequently as in a smaller, more "normal" data set like the training data.
+
+## Penalized Logistic Regression
+
+### Cross-validation
+
+It is necessary to establish a table of all possible $\lambda$ values, which will be inputted into our 10-fold cross validation; this range will encompass twenty values from $10^{-2}$ to 1. In addition, we set our $\alpha$ range to the known zero-to-one scale, arbitrarily sequenced by .1. Furthermore, it is necessary to used our scaled data when implementing penalized logistic regression, as variations in observation values can significantly change the estimated coefficients produced by shrinkage methods.[^9]
+
+[^9]: James, Gareth, et al. *An Introduction to Statistical Learning with Applications in R*. 2nd ed., Springer Nature, 2021., pp. 239
+
+```{r}
+set.seed(42)
+lambda_seq <- seq(from = .01, to = 1, length = 20)
+alpha_seq <- seq(0, 1, length = 10)
+#(https://www.projectpro.io/recipes/implement-elastic-net-regression-r)
+
+tuneGrid <- expand.grid(lambda = lambda_seq, alpha = alpha_seq)
+
+base_elastic <- train(Tarp ~ Red + Green + Blue + Blue*Green, data = Scaled_Haiti, method = 'glmnet', family = 'binomial', trControl = knn_validation, tuneGrid = tuneGrid, metric = "ROC")
+
+base_el_threshold <- thresholder(base_elastic, threshold = seq(.05, .95, by = 0.05), final = TRUE, statistics = "all")
+```
+
+For the sake of brevity, the exact output of our cross-validation on the logistic regression of "Formula 1" with a range of $\lambda$ and $\alpha$ is not shown due to the immense number of possible $\lambda$ and $\alpha$ combinations. However, it did state "ROC was used to select the optimal model using the largest value. The final values used for the model were alpha = 1 and lambda = 0.01." At this point, the AUC was calculated as .9771282. This is a particularly interesting result, as those are our highest and lowest possible values for each of our parameters, respectively. Given the known effectiveness of our logistic regression, this could simply indicate that a penalized version of the model could not produce more effective predictions of our response variable's observations; as James et. al. say, "When λ = 0, the penalty term has no effect, and ridge regression will produce the least squares estimates." [^10]
+
+[^10]: Ibid., pp. 237
+
+```{r}
+base_el_threshold_2 <- thresholder(base_elastic, threshold = seq(0.05, 0.95, by = 0.05), statistics = "all")
+
+base_el_threshold_2$FNR <- 1 - base_el_threshold$Sensitivity
+base_el_threshold_2$FPR <- 1 - base_el_threshold$Specificity
+
+table9 <- base_el_threshold_2 %>% select("prob_threshold", "Accuracy", "Sensitivity", "FPR", "Precision", "Dist") %>% kable(digits = 3) %>% kable_styling(full_width = FALSE)
+
+table9
+```
+
+This table above shows that our penalized logistic regression on "Formula 1" has particularly poor performance on our metrics of choice. While it has usually been the priority to maximize sensitivity during threshold selection, that cannot be the case here due to incredibly low precision values when sensitivity is maximized. As such, .20 will be the selected threshold for this model; while sensitivity is much lower than ideally desired (.668), we at least maximize our precision such that nearly all observations classified as blue tarps are indeed blue tarps, even if many others are missed. This model's ROC curve is shown below.
+
+```{r}
+set.seed(42)
+base_el_prediction <- prediction(predict(base_elastic, Scaled_Haiti, type = "prob")$bluetarp, Scaled_Haiti$Tarp, label.ordering = c('other', 'bluetarp'))
+
+base_el_observations <- performance(base_el_prediction, measure = 'tpr', x.measure = 'fpr')
+
+plot(base_el_observations, colorize = T, print.cutoffs.at = c(0, 0.1, 0.9, 1.0), xlim = c(0, .1), ylim = c(.1, 1), main = "ROC Curve for Base PLS with lambda = .01, alpha = 1: Cross-Validation")
+lines(x = c(0,1), y = c(0,1), col = 'grey')
+```
+
+```{r}
+set.seed(42)
+log_elastic <- train(Tarp ~ logRed + logGreen + logBlue + logBlue*logGreen, data = Scaled_Haiti, method = 'glmnet', family = 'binomial', trControl = knn_validation, tuneGrid = tuneGrid, metric = "ROC")
+
+log_el_threshold <- thresholder(log_elastic, threshold = seq(.05, .95, by = 0.05), final = TRUE, statistics = "all")
+```
+
+Once again, the exact output of our cross-validation, this time on the logistic regression of "Formula 2," is not shown. This time, it states "ROC was used to select the optimal model using the largest value. The final values used for the model were alpha = 0 and lambda = 0.01." At this point, the AUC was calculated as .9731143. Just like in our previous penalized logistic regression, the minimum value of $\lambda$ was chosen. This time, however, the minimum value of $\alpha$ was selected rather than the maximum of 1. Perhaps this is arbitrary, as the minimum value of $\lambda$ indicates again that the effect of shrinkage will be minimized on our model, so the type of shrinkage method is irrelevant.
+
+```{r}
+log_el_threshold_2 <- thresholder(log_elastic, threshold = seq(0.05, 0.95, by = 0.05), statistics = "all")
+
+log_el_threshold_2$FNR <- 1 - log_el_threshold$Sensitivity
+log_el_threshold_2$FPR <- 1 - log_el_threshold$Specificity
+
+table10 <- log_el_threshold_2 %>% select("prob_threshold", "Accuracy", "Sensitivity", "FPR", "Precision", "Dist") %>% kable(digits = 3) %>% kable_styling(full_width = FALSE)
+
+table10
+```
+
+Our options for optimal threshold selection for PLR applied to "Formula 2" are few and far between. Given the extremely low precision of .153 when sensitivity is maximized in the table above, we cannot afford to blindly prioritize a high sensitivity. Rather, .10 appears to be the best threshold to select for this model. It has the same precision (1, in fact) as that of the .15 threshold, but a sensitivity .404 higher.
+
+```{r}
+set.seed(42)
+log_el_prediction <- prediction(predict(log_elastic, Scaled_Haiti, type = "prob")$bluetarp, Scaled_Haiti$Tarp, label.ordering = c('other', 'bluetarp'))
+
+log_el_observations <- performance(log_el_prediction, measure = 'tpr', x.measure = 'fpr')
+
+plot(log_el_observations, colorize = T, print.cutoffs.at = c(0, 0.1, 0.9, 1.0), xlim = c(0, 1), ylim = c(.1, 1), main = "'Formula 2' PLR ROC Curve w/ lambda = .01, alpha = 0: Cross-Validation")
+lines(x = c(0,1), y = c(0,1), col = 'grey')
+```
+
+Unsurprisingly, the ROC curve for this implementation of PLR appears to be much worse than that of nearly every other model previously cross-validated, other than falling in line with the ROC curve for the previous PLR. Given that our chosen threshold for the PLR model on "Formula 1" had a sensitivity of .668 and precision of .976, compared to values of .497 and 1.0 for the PLR model on "Formula 2," **we will select "Formula 1" at a .20 threshold as the optimal Penalized Logistic Regression from our cross-validation analysis.**
+
+### Holdout Testing
+
+We will now apply the selected penalized logistic regression model from cross-validation to our holdout data set. We first plot an updated ROC curve based on the model's predictions on the holdout set, and then calculate our various performance metrics at the selected threshold from cross-validation. Once again, The ROC curve here is created using a different library, `pROC`, due to a difference in the gathering of predictions relative to cross-validation models which causes an issue.
+
+```{r}
+set.seed(42)
+
+test_predict2 <- predict(base_elastic, Scaled_HoldOut, type = 'prob')
+
+rocobj <- roc(Scaled_HoldOut$Tarp, test_predict2$bluetarp)
+auc2 <- round(auc(Scaled_HoldOut$Tarp, test_predict2$bluetarp),7)
+ggroc(rocobj) +
+  ggtitle(paste0('ROC Curve for PLR Applied to "Formula 1:" Holdout'))
+```
+
+```{r}
+auc2
+```
+
+This AUC value is a notable improvement, one of approximately two hundredths, from the value of .9771282 originally associated with penalized logistic regression applied to "Formula 1" on the training data.
+
+```{r}
+test5 = rep("other", 2004177)
+test5[test_predict2$bluetarp > .20] = "bluetarp"
+test5 <- data.frame(test5)
+colnames(test5)[1] = "Tarp"
+#https://sparkbyexamples.com/r-programming/rename-column-in-r/
+
+test5$Tarp <- as.factor(test5$Tarp)
+```
+
+```{r}
+confusionMatrix(data = test5$Tarp, reference = Scaled_HoldOut$Tarp, positive = "bluetarp")
+```
+
+Penalized logistic regression appears to have performed much, much better on the holdout data than the training data. In fact, it is the best-performing model on the holdout data yet. For the selected optimal model from cross-validation, sensitivity has improved from .668 to .904. What's more the precision value of .775 is far more reasonable than other holdout-tested models, although still below our cross-validation standard. Admittedly, this model's dramatic improvement is quite confounding, as parameter tuning completed via cross-validation indicated that our penalized logistic regression was simply a least-squares regression due to the lack of penalty terms.
+
+## Random Forest
+
+### Cross-validation
+
+The first new modeling method used on our data is a tree-based random forest, meaning it can be used for classification prediction by binarily splitting each predictor variable at a given threshold; a given observation is classified based on whether one or many of its predictor variable values falls on a given side of each corresponding binary split.[^11] Random forests set themselves apart from other tree-based methods in that at each "split" in a model's tree, a random subset of the model's predictors is used to classify observations rather than every predictor the model is fed.[^12] In fact, the number of predictors to feed into a random forest is a tuning parameter $m$; the typical value of $m$ in a random forest model is the square root of the number of predictors, of which each of our formulas has just four.[^13] Nonetheless, the `train()` function in `caret` automatically evaluates a random forest at each possible $m$, and saves the results of the models whose $m$ results in the highest accuracy.
+
+[^11]: Ibid., pp. 335
+
+[^12]: Ibid., pp. 343
+
+[^13]: Ibid.
+
+```{r}
+set.seed(42)
+
+#tree_seq <- seq(from = 1, to = 1000, length = 1000)
+
+rf_validation = trainControl("cv", number = 10, savePredictions = TRUE, returnResamp = 'all', classProbs = TRUE)
+
+base_rf <- train(Tarp ~ Red + Green + Blue + Blue*Green, data = Haiti, method = 'rf', importance = TRUE, trControl = rf_validation)
+
+base_rf_threshold <- thresholder(base_rf, threshold = seq(.05, .95, by = 0.05), final = TRUE, statistics = "all")
+
+base_rf
+```
+
+The output above shows that the optimal value of $m$ based on accuracy is 2. Obviously, accuracy is far from an ideal evaluation metric given the imbalance in our response's classifications; however, there are very few possible $m$ values to choose from in our model in the first place, and the chosen value of two does line up with the typically-selected $m$ value of the square root of predictors.
+
+```{r}
+base_rf_threshold$FNR <- 1 - base_rf_threshold$Sensitivity
+base_rf_threshold$FPR <- 1 - base_rf_threshold$Specificity
+
+table11 <- base_rf_threshold %>% select("prob_threshold", "Accuracy", "Sensitivity", "FPR", "Precision", "Dist") %>% kable(digits = 3) %>% kable_styling(full_width = FALSE)
+
+table11
+```
+
+The table above shows that a random forest applied to our "Formula 1" is rather strong, and even comparable to our KNN applications. The lowest precision in the table is above .850, and sensitivity remains higher than .9 through the .75 threshold. I will select the .25 threshold from the table above, but any threshold between .20 and .75 can be argued as "optimal." Regardless, the .25 threshold maintains a very impressive precision (.925) while avoiding sacrificing much from our most important metric, sensitivity (.976).
+
+```{r}
+set.seed(42)
+base_rf_prediction <- prediction(predict(base_rf, Haiti, type = "prob")$bluetarp, Haiti$Tarp, label.ordering = c('other', 'bluetarp'))
+
+base_rf_observations <- performance(base_rf_prediction, measure = 'tpr', x.measure = 'fpr')
+
+plot(base_rf_observations, colorize = T, print.cutoffs.at = c(0, 0.1, 0.9, 1.0), xlim = c(0, 1), ylim = c(.9, 1), main = "ROC Curve for Base Random Forest with m = 2: Cross-Validation")
+lines(x = c(0, 1), y = c(0,1), col = 'grey')
+```
+
+Given the extremely low false-positive rate across all thresholds in our random forest applied to "Formula 1," it is unsurprising to see such a strong ROC curve.
+
+```{r}
+set.seed(42)
+
+#tree_seq <- seq(from = 1, to = 1000, length = 1000)
+
+log_rf <- train(Tarp ~ logRed + logGreen + logBlue + logBlue*logGreen, data = Haiti, method = 'rf', importance = TRUE, trControl = rf_validation)
+
+log_rf_threshold <- thresholder(log_rf, threshold = seq(.05, .95, by = 0.05), final = TRUE, statistics = "all")
+
+log_rf
+```
+
+The output above shows the initial results of a random forest applied to "Formula 2," and we can once again see that the model with an $m$ of two was selected as the optimal model.
+
+```{r}
+log_rf_threshold$FNR <- 1 - log_rf_threshold$Sensitivity
+log_rf_threshold$FPR <- 1 - log_rf_threshold$Specificity
+
+table12 <- log_rf_threshold %>% select("prob_threshold", "Accuracy", "Sensitivity", "FPR", "Precision", "Dist") %>% kable(digits = 3) %>% kable_styling(full_width = FALSE)
+
+table12
+```
+
+The table above shows very similar performance results for our random forest applied to "Formula 2" compared to the same method applied to "Formula 1." Both the range in precision across all thresholds and the maximum sensitivity above differ by just .001 from the previous table. In fact, the sensitivity and precision values at the .25 threshold above are identical to those from "Formula 1" at the same threshold, meaning that threshold will also be selected as optimal from this random forest application.
+
+```{r}
+set.seed(42)
+log_rf_prediction <- prediction(predict(log_rf, Haiti, type = "prob")$bluetarp, Haiti$Tarp, label.ordering = c('other', 'bluetarp'))
+
+log_rf_observations <- performance(log_rf_prediction, measure = 'tpr', x.measure = 'fpr')
+
+plot(log_rf_observations, colorize = T, print.cutoffs.at = c(0, 0.1, 0.9, 1.0), xlim = c(0, 1), ylim = c(.9, 1), main = "ROC Curve for 'Formula 2' Random Forest with m = 2: Cross-Validation")
+lines(x = c(0, 1), y = c(0,1), col = 'grey')
+```
+
+Given the extreme similarity between the random forest applied to both formulas, especially regarding false positive rate, it is unsurprising to see the ROC curve above for "Formula 2" strongly mimic that of "Formula 1." Ultimately, the only difference between our selected threshold for each random forest application (.25) is our "Dist" metric, which is .001 better for our random forest applied to "Formula 1" (.024 versus .025). With nothing else to separate the two models, **we will select "Formula 1" at a .25 threshold as the optimal random forest from our cross-validation analysis.**
+
+### Holdout Testing
+
+We will now apply the selected random forest model from cross-validation to our holdout data set. We first plot an updated ROC curve based on the model's predictions on the holdout set, and then calculate our various performance metrics at the selected threshold from cross-validation. For the final time, The ROC curve here is created using a different library, `pROC`, due to a difference in the gathering of predictions relative to cross-validation models which causes an issue.
+
+```{r}
+set.seed(42)
+
+test_predict3 <- predict(base_rf, HoldOut, type = 'prob')
+
+rocobj <- roc(HoldOut$Tarp, test_predict3$bluetarp)
+auc3 <- round(auc(HoldOut$Tarp, test_predict3$bluetarp),7)
+ggroc(rocobj) +
+  ggtitle(paste0('ROC Curve for Random Forest Applied to "Formula 1:" Holdout'))
+```
+
+```{r}
+auc3
+```
+
+The ROC curve above follows a very similar shape to the ROC curve of the random forest model applied to "Formula 1" and trained by cross-validation, which uniquely saw a steady increase towards a true positive rate of 1 as the curve moves along the x-axis. However, the curve immediately above deviates from a specificity of 1 much further down the y-axis compared to the corresponding cross-validation curve.
+
+```{r}
+test6 = rep("other", 2004177)
+test6[test_predict3$bluetarp > .20] = "bluetarp"
+test6 <- data.frame(test6)
+colnames(test6)[1] = "Tarp"
+#https://sparkbyexamples.com/r-programming/rename-column-in-r/
+
+test6$Tarp <- as.factor(test6$Tarp)
+```
+
+```{r}
+confusionMatrix(data = test6$Tarp, reference = HoldOut$Tarp, positive = "bluetarp")
+```
+
+We see a strong sensitivity of .989, which improves on the sensitivity from this model trained via cross-validation at our selected optimal threshold of .20. Given that a random forest uses the "wisdom of the crowd" (as analogized in the Module 8 document for this course) and calculates the average of all of its trees, this improved sensitivity may simply come down to the increased sample size of the holdout data set;[^14] that is, the more data there is, the more effective a random forest model becomes due to its inherent nature of aggregating its results. At the same time, this is yet another model which struggles with precision when tested via the holdout set.
+
+[^14]: Ibid., pp. 344
+
+## Support Vector Machine
+
+### Cross-validation
+
+The second new, and final overall, modeling method applied to each formula is the support vector machine (SVM). An SVM is a type of maximal margin classifier, meaning it attempts to classify observations in terms of their plotted location relative to a calculated "hyperplane."[^15]. What sets an SVM apart from other maximal margin classifiers is its ability to classify observations that may be separated in a non-linear fashion;[^16] that is, you cannot simply separate all values in one class from another with a linear hyperplane.
+
+[^15]: Ibid., pp. 367, 369
+
+[^16]: Ibid., pp. 367
+
+Application of this statistical method requires the tuning of two primary parameters. Firstly, an SVM's "kernel" refers to a type of function which transforms the data in some sort of non-linear fashion; as such, observations are classified based on their non-linear transformation rather than their original form.[^17] Secondly, the value $C$ is a parameter which controls how "strict" the SVM can be in terms of properly classifying every single observation; a higher $C$ means the machine may misclassify more observations in order to avoid a high-variance model.[^18] In addition, other tuning parameters may appear depending on the kernel chosen, which will be addressed depending on the optimal kernel eventually selected below.
+
+[^17]: Gupta, Aman. "Kernel Tricks in Support Vector Machines." *Medium*, 1 June 2021, medium.com/geekculture/kernel-methods-in-support-vector-machines-bb9409342c49.
+
+[^18]: James, Gareth, et al. *An Introduction to Statistical Learning with Applications in R*. 2nd ed., Springer Nature, 2021., pp. 376, 377
+
+Three different kernels, "linear," "radial," and "polynomial," will be applied to each SVM of each formula. Another kernel, "sigmoid," also exists, but it was simply not introduced in our course's application of SVM's. Unlike with previous statistical methods, the `tune` function within the `e1071` package will be used to tune the parameters associated with each kernel using ten-fold cross-validation. Linear kernels, which aptly generate a linear decision boundary between classes,[^19] simply require tuning of $C$. Radial kernels require tuning of $C$ and $\gamma$, a number which represents the maximum distance away from the non-linear decision boundary that includes observations which "have an effect on the class label of a test observation."[^20] Polynomial kernels require tuning of $C$ and the degree which the formula is raised to (hence the name "polynomial" kernel).[^21] For each formula, the possible value of $C$ is the set of values (.1, 1, 10, 100, 1000) as used in Section 9.6 of our course's textbook; the kernel type and tuning parameter combination with the lowest error will then be run (using `e1071`'s `svm()` function) and evaluated.
+
+[^19]: Ibid. pp. 382
+
+[^20]: Ibid. pp. 382, 383
+
+[^21]: Ibid. pp. 382
+
+```{r}
+set.seed(42)
+
+base_svm_tune_lin <- tune(svm, Tarp ~ Red + Green + Blue + Blue*Green, data = Haiti, kernel = "linear", ranges = list(cost = c(0.1, 1, 10, 100, 1000)))
+
+summary(base_svm_tune_lin)
+#"An Introduction to Statistical Learning with Applications in R" Section 9.6.2, page 390
+```
+
+The table above shows the test error rate for each value of $C$ in the SVM application on our "Formula 1" with a linear kernel. It can be seen that the lowest error (.004079634) occurs at a cost value of "1e+01," or ten.
+
+```{r}
+set.seed(42)
+
+tunetest <- tune(svm, Tarp ~ Red + Green + Blue + Blue*Green, data = Haiti, kernel = "radial", ranges = list(cost = c(0.1, 1, 10, 100, 1000), gamma = c(0.5, 1, 2, 3, 4)))
+
+base_svm_tune_rad <- tunetest
+summary(base_svm_tune_rad)
+#"An Introduction to Statistical Learning with Applications in R" Section 9.6.2, page 394
+```
+
+The output above shows that the lowest test error rate for an SVM applied to our "Formula 1" with a radial kernel occurs when $C$ equals 1,000 and $\gamma$ equals three; the set of possible $\gamma$ values was (.5, 1, 2, 3, 4) as used in Section 9.6.2 of our course's textbook. The table of all tuning parameter combinations is not shown for brevity's sake, but the error rate at this optimal parameter combination was .002672317.
+
+```{r}
+set.seed(42)
+
+base_svm_tune_pol <- tune(svm, Tarp ~ Red + Green + Blue + Blue*Green, data = Haiti, kernel = "polynomial", ranges = list(cost = c(0.1, 1, 10, 100, 1000), degree = c(1, 2, 3, 4, 5)))
+
+summary(base_svm_tune_pol)
+#Implementation of `degree` from DS-6030 Homework Module 9 Feedback document
+```
+
+The output above shows that the lowest test error rate for an SVM applied to our "Formula 1" with a polynomial kernel occurs when $C$ equals 1,000 and the degree equals four; the set of possible degrees values was simply one through five, similar to that used in our course's "DS-6030 Homework Module 9 Feedback" document (six was not included here as a degree option for the sake of time). Again, the table of all tuning parameter combinations is not shown for brevity's sake, but the error rate at this optimal parameter combination was .003478756.
+
+Given the error values from each of these cross-validation tunings, we will select an SVM with a radial kernel, $C$ of 1,000, and $\gamma$ of three as our optimal SVM applied to "Formula 1."
+
+```{r}
+set.seed(42)
+
+base_svm <- svm(Tarp ~ Red + Green + Blue + Blue*Green, data = Haiti, kernel = "radial", gamma = 3, cost = 1000, decision.values = TRUE, probability = TRUE)
+#Module 9 course document, Section 2
+
+base_svm_pred <- predict(base_svm, Haiti, probability = TRUE)
+
+confusionMatrix(data = base_svm_pred, reference = Haiti$Tarp, positive = "bluetarp")
+#Module 3 course document; "Caret - confusionMatrix" in "Classification metrics" in "Metrics" in "Using R"
+```
+
+Since the tuning parameters within an SVM essentially set the decision boundary for observation classification, this statistical method does not produce class probabilities in the traditional sense as seen in the other methods applied previously; as such, the concept of probability thresholds does not necessary apply to SVM's.[^22] Therefore, we can simply find our precision and sensitivity using the output of the confusion matrix of our SVM above. Our sensitivity is approximately .965, while our precision is approximately .966.
+
+[^22]: Luckett, Daniel J et al. "Receiver operating characteristic curves and confidence bands for support vector machines." *Biometrics* vol. 77,4 (2021): 1422-1430. <doi:10.1111/biom.13365>
+
+```{r}
+roccurve <- function(obs, label, ...) {
+   preds <- prediction(obs, label)
+   svm_perf <- performance(preds, "fpr", "tpr")
+   plot(svm_perf, ..., ylim = c(.3, 1), xlab = "False positive rate", ylab = "True positive rate")
+}
+#Module 9 course document, Section 2
+#Switching axes for readable plot: Module 9 Topic 9.5, Support Vector Machine Lab
+#Axis limit: https://www.geeksforgeeks.org/how-to-change-axis-scales-in-r-plots/
+#Axis labels: https://r-coder.com/plot-r/#R_plot_x_and_y_labels 
+
+base_svm_fits <- attr(base_svm_pred, 'probabilities')[,2]
+roccurve(base_svm_fits, Haiti$Tarp, main = "ROC Curve for Formula 1 SVM: Cross-Validation")
+#Module 9 course document, Section 2
+```
+
+```{r}
+svm_pred <- prediction(base_svm_fits, Haiti$Tarp)
+svm_perf <- performance(svm_pred, "auc")
+1 - svm_perf@y.values[[1]]
+```
+
+Given the very high sensitivity calculated above, it is no surprise to see such a strong ROC curve and AUC value for this application of SVM (which, as previously alluded to, is not calculated with traditional class probabilities).
+
+```{r}
+set.seed(42)
+
+log_svm_tune_lin <- tune(svm, Tarp ~ logRed + logGreen + logBlue + logBlue*logGreen, data = Haiti, kernel = "linear", ranges = list(cost = c(0.1, 1, 10, 100, 1000)))
+
+summary(log_svm_tune_lin)
+```
+
+The table above shows the test error rate for each value of $C$ in the SVM application on our "Formula 2" with a linear kernel. It can be seen that the lowest error (.00414288) occurs at a cost value of "1e+03," or 1,000.
+
+```{r}
+set.seed(42)
+
+log_svm_tune_rad <- tune(svm, Tarp ~ logRed + logGreen + logBlue + logBlue*logGreen, data = Haiti, kernel = "radial", ranges = list(cost = c(0.1, 1, 10, 100, 1000), gamma = c(0.5, 1, 2, 3, 4)))
+
+summary(log_svm_tune_rad)
+```
+
+The output above shows that the lowest test error rate for an SVM applied to our "Formula 2" with a radial kernel occurs when $C$ equals 100 and $\gamma$ equals four. The table of all tuning parameter combinations is not shown for brevity's sake, but the error rate at this optimal parameter combination was .00268813.
+
+```{r}
+set.seed(42)
+
+log_svm_tune_pol <- tune(svm, Tarp ~ logRed + logGreen + logBlue + logBlue*logGreen, data = Scaled_Haiti, kernel = "polynomial", ranges = list(cost = c(0.1, 1, 10, 100, 1000), degree = c(1, 2, 3, 4, 5)))
+
+summary(log_svm_tune_pol)
+```
+
+The output above shows that the lowest test error rate for an SVM applied to our "Formula 2" with a polynomial kernel occurs when $C$ equals 1,000 and the degree equals five. Again, the table of all tuning parameter combinations is not shown for brevity's sake, but the error rate at this optimal parameter combination was .00298857. It should be noted that for this SVM, a scaled version of the training data is used because of previous runtime and iteration issues when using the original data set. A warning message was being thrown saying that the `tune()` function's maximum number of iterations was reached before finding the optimal model.
+
+Given the error values from each of these cross-validation tunings, we will select an SVM with a radial kernel, $C$ of 100, and $\gamma$ of four as our optimal SVM applied to "Formula 2."
+
+```{r}
+set.seed(42)
+
+log_svm <- svm(Tarp ~ logRed + logGreen + logBlue + logBlue*logGreen, data = Haiti, kernel = "radial", gamma = 4, cost = 100, decision.values = TRUE, probability = TRUE)
+#Module 9 course document, Section 2
+
+log_svm_pred <- predict(log_svm, Haiti, probability = TRUE)
+
+#table(predict = log_svm_pred, truth = Haiti$Tarp)
+#Module 9 Topic 9.5, Support Vector Machine Lab
+
+confusionMatrix(data = log_svm_pred, reference = Haiti$Tarp, positive = "bluetarp")
+```
+
+The information above shows the confusion matrix and our various metrics for the SVM with a radial kernel applied to "Formula 2." We see slightly worse, but still generally strong, sensitivity and precision values compared to those from "Formula 1," at .959 and .963, respectively.
+
+```{r}
+log_svm_fits <- attr(log_svm_pred, 'probabilities')[,2]
+roccurve(log_svm_fits, Haiti$Tarp, main = "ROC Curve for Formula 2 SVM: Cross-Validation")
+```
+
+```{r}
+svm_predl <- prediction(log_svm_fits, Haiti$Tarp)
+svm_perfl <- performance(svm_predl, "auc")
+1 - svm_perfl@y.values[[1]]
+```
+
+As expected, we see an ROC curve and AUC value for our SVM applied to "Formula 2" that are nearly identical to that of our SVM applied to "Formula 1," given the extremely similar sensitivity values between the two. Given that our SVM applied to "Formula 1" has a slightly better sensitivity (.965) and precision (.966) than that of "Formula 2," **we will select "Formula 1" with a radial kernel,** $C$ of 1,000, and $\gamma$ of three as the optimal Support Vector Machine from our cross-validation analysis.
+
+### Holdout Testing
+
+We will now apply the selected support vector machine from cross-validation to our holdout data set. We first plot an updated ROC curve based on the model's predictions on the holdout set, and then calculate our various performance metrics at the selected threshold from cross-validation. The ROC curve here is created in the same way that the curves were created for the SVM's trained using cross-validation above.
+
+```{r}
+set.seed(42)
+
+holdout_svm_pred <- predict(base_svm, HoldOut, probability = TRUE)
+```
+
+```{r}
+roccurve <- function(obs, label, ...){
+   preds <- prediction(obs, label)
+   svm_perf <- performance(preds, "fpr", "tpr")
+   plot(svm_perf, ..., ylim = c(.25, 1), xlab = "False positive rate", ylab = "True positive rate")
+}
+holdout_svm_fits <- attr(holdout_svm_pred, 'probabilities')[,2]
+roccurve(holdout_svm_fits, HoldOut$Tarp, main = "ROC Curve for Formula 1 SVM: Holdout")
+```
+
+```{r}
+svm_predh <- prediction(holdout_svm_fits, HoldOut$Tarp)
+svm_perfh <- performance(svm_predh, "auc")
+1 - svm_perfh@y.values[[1]]
+```
+
+The ROC curve and AUC value above appear to be a fairly significant downgrade from those of the same SVM applied to "Formula 1" trained via cross-validation and the training data; the AUC value has decreased by about four hundredths. Perhaps this decline in performance is due to the fact that the holdout data set is inherently shaped in such a way that a radial kernel and our tuned parameters do not conform as well here as compared to the training data. We did see a noticeable difference in the distribution of pixel color values between the data sets during exploratory data analysis.
+
+```{r}
+confusionMatrix(data = holdout_svm_pred, reference = HoldOut$Tarp, positive = "bluetarp")
+```
+
+Our SVM's precision has dropped significantly when tested with the holdout data, as has often been the case, but what sticks out most here is the dramatic decrease in sensitivity as well. As was just alluded to, the dramatic change in performance when presented with a different data set may mean that SVM tuning parameters are very sensitive to changes in the data they are applied to. That is, truly optimal selection of SVM may require further iterations of cross-validation on both the original data set and very similar ones as well.
+
+# Performance Tables
+
+## Cross-validation
+
+| **Model**                                    | **Optimal Tuning Parameters**        | **AUC**  | **Selected Threshold** | **Accuracy** | **TPR** | **FPR** | **Precision** |
+|---------|---------|---------|---------|---------|---------|---------|---------|
+| Logistic Regression on "Formula 2"           | N/A                                  | .9994077 | .15                    | .996         | .971    | .003    | .914          |
+| LDA on "Formula 2"                           | N/A                                  | .9992071 | .15                    | .996         | .957    | .003    | .913          |
+| QDA on "Formula 2"                           | N/A                                  | .9991143 | .30                    | .996         | .962    | .003    | .906          |
+| KNN on "Formula 2"                           | K = 15                               | .9994940 | .30                    | .997         | .980    | .003    | .920          |
+| Penalized Logistic Regression on "Formula 1" | alpha = 1, lambda = .01              | .9771282 | .20                    | .989         | .668    | .001    | .976          |
+| Random Forest on "Formula 1"                 | m = 2                                | N/A      | .25                    | .997         | .976    | .003    | .925          |
+| Support Vector Machine on "Formula 1"        | kernel = radial, C = 1000, gamma = 3 | .9998067 | N/A                    | .998         | .965    | .035    | .966          |
+
+Each of the metrics above were calculated across the implementation of 10-fold cross-validation. Specifically, each metric shown above is its average at that given threshold across all ten iterations of cross-validation.[^23]
+
+[^23]: Curtis, John J. "4.4 K-Fold Cross-Validation." Introduction to Applied Machine Learning, University of Wisconsin-Madison Department of Psychology, Madison, Wisconsin, 2020.
+
+## Holdout Testing
+
+| **Model**                                    | **Optimal Tuning Parameters**        | **AUC**  | **Selected Threshold** | **Accuracy** | **TPR** | **FPR** | **Precision** |
+|---------|---------|---------|---------|---------|---------|---------|---------|
+| Logistic Regression on "Formula 2"           | N/A                                  | .9994343 | .15                    | .974         | .994    | .026    | .217          |
+| LDA on "Formula 2"                           | N/A                                  | .9995744 | .15                    | .987         | .992    | .013    | .358          |
+| QDA on "Formula 2"                           | N/A                                  | .9651494 | .30                    | .989         | .855    | .010    | .379          |
+| KNN on "Formula 2"                           | K = 15                               | .9804081 | .30                    | .946         | .929    | .054    | .111          |
+| Penalized Logistic Regression on "Formula 1" | alpha = 1, lambda = .01              | .9977389 | .20                    | .997         | .905    | .002    | .775          |
+| Random Forest on "Formula 1"                 | m = 2                                | .9775991 | .25                    | .988         | .894    | .011    | .362          |
+| Support Vector Machine on "Formula 1"        | kernel = radial, C = 1000, gamma = 3 | .9596963 | N/A                    | .990         | .557    | .007    | .373          |
+
+Each of the metrics above were calculated across the implementation of the confusion matrices above. Specifically, each metric is either taken directly from the list provided within each confusion matrix output, or calculated from a value within the confusion matrix output. For example, FPR was calculated by subtracting the "Specificity" value from one in each confusion matrix output.
+
+# Conclusions
+
+## 1.
+
+As has been established previously, given the context of rescue efforts in Haiti and avoiding misclassifying blue tarps as another category, the most important metrics for optimal model selection throughout this research have been sensitivity and precision. As such, I have determined that the optimal cross-validation-trained model for this data analysis is **SVM applied to "Formula 1."** As shown in the first performance table above, this model has a sensitivity only .15 below the highest of all models while maintaining a better precision value, something no other well-performing model can claim. As such, within our cross-validation results, SVM is the best of both worlds: it maintains a high number of blue tarps in our denominator from which rescue workers will search, while also minimizing the number of times a search will come up empty. The optimal holdout-tested model is quite easy to determine, and is the **Penalized Logistic Regression applied to "Formula 1."** It has, far-and-away, the highest precision of holdout-tested models while maintaining a sensitivity above .9
+
+## 2.
+
+Despite my selection of SVM as the optimal cross-validated model, there appeared to be multiple adequately performing methods which had similar performance metrics to those of SVM. In fact, all of the models in the first performance table above except for penalized logistic regression had very similar performance metric values. Each of logistic regression, LDA, QDA, and KNN at their optimal thresholds had sensitivities of .957 or greater and precision values of .906 or higher. Despite the fact that many of these performance metrics are nearly suspiciously strong, I have a high level of confidence in the results for these for metrics. This is because we know that 97 percent of the observations in our training data set are classified in a category other than "Blue Tarp," and the only given numerical variables are extremely similar to one another and directly contribute to that classification. As such, we would expect our models to perform well when most observations can be easily classified and there are no issues of omitted variable bias or subset selection. It is thanks to this, and the real-life context of this data, that I can be particular enough to scrutinize metrics down to the one-thousandth (as I have done throughout this research); assuming the results of these models are trusted, every change in a metrics value by any amount can be the difference between a rescuer finding a displaced person and completely forgoing searching the area where that person might be.
+
+## 3.
+
+Despite having chosen an optimal model from both cross-validation and holdout testing, the true "optimal" model for real-world application must be the one which ideally performed best across both data sets; after all, the holdout data set contains real-world observations from our situation at hand. Unfortunately, it cannot be said that any modeling method performed universally well. Regardless, I believe that the optimal model for real-world application is a Support Vector Machine, though not necessarily with the parameters tuned the way they are in this particular holdout analysis. As I mentioned earlier, SVM's surprisingly poor performance after cross-validation could well be the result of very sensitive tuning parameters. That is, I would like to say that SVM's cross-validation result is far more indicative of its ability as a model than its holdout testing result. Logically speaking, it is much more likely for a model to fail due to tuning parameter error than "trip" into the success SVM saw after cross-validation.
+
+## 4.
+
+Throughout this project, I have emphasized the importance of sensitivity as the primary metric for evaluating model performance given the real-world implications of the data. However, the poor performance of each model when applied to the holdout data requires a rethink of this approach. Namely, in a real-world scenario, it must be acknowledged that "triaging" may become a necessity. That is, if a data scientist's job is to pinpoint locations of survivors in this rescue effort, and the overall efficacy of the models is unknown, it is a much better strategy for rescue workers to devote their resources to places where they know at least one survivor is present, rather than searching many "potential" survivor locations only to come up empty (i.e., emphasizing precision over sensitivity). I would not be surprised if each optimal cross-validation model showed different performance on the holdout data if precision was the original primary evaluation metric rather than sensitivity.
+
+## 5.
+
+Early on in this project, I predicted that the models using log-transformed variables would see more success in both cross-validation and holdout testing. However, the split between optimal "base" and log-transformed models from cross-validation was three versus four, and both of my optimal models from Conclusion 1 were methods applied to the non-transformed data. I suspect that my incorrect prediction is simply due to my overestimation of the potential impact of heteroscedasticity on the eventual results. One fact about heteroscedasticity that I failed to mention was that it "[violates]...the assumptions for linear regression modeling,"[^24] meaning it very well may have had no bearing on the performance of non-linear models such as QDA and SVM, which each had non-transformed optimal models when cross-validated on the training data. Further corroborating this is the fact that modeling methods much closer to linear regression, namely logistic regression and LDA, had optimal cross-validation models which were log-transformed, indicating the heteroscedasticity may have impacted them more.
+
+[^24]: Hayes, Adam. "Heteroscedasticity Definition: Simple Meaning and Types Explained." Edited by Peter Westfall and Suzanne Kvilhaug, *Investopedia*, 18 Feb. 2023, www.investopedia.com/terms/h/heteroskedasticity.asp#:\~:text=Investopedia%20%2F%20Joules%20Garcia-,What%20Is%20Heteroskedasticity%3F,periods%2C%20are%20non%2Dconstant.
+
+## 6.
+
+One consideration for future research on this topic and with this data would be determining a more reliable method for selecting the optimal threshold for each optimal model within the context I originally established. In other words, I would like to determine a more concrete way of answering the question, "which threshold allows us to ensure we correctly identify all blue tarps, while also minimizing the number of 'false alarms' we produce?" As I detailed previously, my shorthand method of answering this question was simply by observing where the marginal trade-off between sensitivity and precision *appeared* to reach a point where an increase in one was not worth the decrease in the other. Perhaps a more concrete solution involves some sort of calculation of the "diminishing marginal returns" of one of these metrics within the context of the other (i.e. actually tangibly calculating where the increase in one of the metrics corresponds with an "inefficient" decrease/tradeoff in the other).
